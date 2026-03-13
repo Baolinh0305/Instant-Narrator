@@ -1,27 +1,18 @@
-# TTS Engines
-
-## F5-TTS
-
-- Chay: `start_f5_tts_gpu.bat`
-- Web UI: `http://127.0.0.1:7860`
-- UI da duoc rut gon.
-- Co nut `Lay text bang Gemini` de tu dong dien `Text mau`.
-- Script da tu them FFmpeg shared vao `PATH`.
+﻿# TTS Engines
 
 ## Qwen3-TTS
 
-- Chay: `start_qwen3_tts_gpu.bat`
+- Run: `start_qwen3_tts_gpu.bat`
 - Web UI: `http://127.0.0.1:7861`
-- Script mac dinh dung model `Qwen/Qwen3-TTS-12Hz-1.7B-Base`.
-- Lan dau chay se tu tai model tu Hugging Face.
-- Dang chay GPU `cuda:0`, `float16`, `--no-flash-attn`.
-- Neu bat file `.bat` ma cua so tu tat, script moi se giu lai console neu co loi de de xem traceback.
-- UI da duoc rut gon.
-- Co nut `Lay text bang Gemini` de tu dong dien `Text mau`.
-- `Use x-vector only`: nhanh hon, khong can text mau, nhung do giong va nhip noi thuong kem hon.
+- Default model: `Qwen/Qwen3-TTS-12Hz-1.7B-Base`
+- First run downloads the model from Hugging Face.
+- Runs on GPU `cuda:0`, `float16`, `--no-flash-attn`.
+- If the `.bat` window closes on error, the script keeps the console open so traceback stays visible.
+- The UI is reduced and includes Gemini-assisted reference text filling.
+- `Use x-vector only` is faster and does not require reference text, but usually gives weaker similarity and prosody.
 
-## Ghi chu
+## Notes
 
-- Ca hai moi truong da cai rieng trong `engines\`.
-- Qwen3-TTS can `SoX`; script da tu them vao `PATH`.
-- Model/cache moi se duoc luu trong `models-cache\` ngay tai thu muc du an, khong dung cache mac dinh o `C:\Users\ngbal\.cache\huggingface`.
+- The Qwen environment is installed under `engines\`.
+- Qwen3-TTS requires `SoX`; the script appends it to `PATH`.
+- Model/cache files are stored under `models-cache\` inside the project, not under the default Hugging Face cache in `C:\Users\ngbal\.cache\huggingface`.

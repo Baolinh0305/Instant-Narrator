@@ -4,6 +4,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Mutex;
@@ -71,7 +72,7 @@ const VIDEO_FONT_OPTIONS: &[&str] = &[
     "Consolas",
 ];
 const DEFAULT_VIDEO_FONT_SIZE: u32 = 60;
-const VIDEO_SUBTITLE_LEAD_SECONDS: f64 = 0.8;
+const DEFAULT_VIDEO_SUBTITLE_LEAD_SECONDS: f32 = 0.0;
 
 const MALE_VOICES: &[&str] = &[
     "Achird",
@@ -366,6 +367,10 @@ struct PersistedState {
     export_speaker_settings: Vec<SpeakerExportSetting>,
     auto_merge_after_render: bool,
     video_background_path: String,
+    video_corner_tag: String,
+    video_tag_position: VideoTagPosition,
+    video_tag_font_size: u32,
+    video_tag_background_enabled: bool,
     video_font_name: String,
     video_text_color: String,
     video_card_opacity: u8,
@@ -378,6 +383,7 @@ struct PersistedState {
     video_preview_audio_path: String,
     video_preview_clip_duration_seconds: u32,
     video_word_highlight_enabled: bool,
+    video_subtitle_lead_seconds: f32,
 }
 
 impl Default for PersistedState {
@@ -395,6 +401,10 @@ impl Default for PersistedState {
             export_speaker_settings: Vec::new(),
             auto_merge_after_render: true,
             video_background_path: String::new(),
+            video_corner_tag: String::new(),
+            video_tag_position: VideoTagPosition::TopLeft,
+            video_tag_font_size: 70,
+            video_tag_background_enabled: false,
             video_font_name: "Tahoma".to_string(),
             video_text_color: "#FFFFFF".to_string(),
             video_card_opacity: 185,
@@ -407,6 +417,7 @@ impl Default for PersistedState {
             video_preview_audio_path: String::new(),
             video_preview_clip_duration_seconds: 12,
             video_word_highlight_enabled: true,
+            video_subtitle_lead_seconds: DEFAULT_VIDEO_SUBTITLE_LEAD_SECONDS,
         }
     }
 }
@@ -447,7 +458,48 @@ enum VideoEvent {
         word_segments: Vec<TimedWordSegment>,
     },
     Done(PathBuf),
+    Cancelled(String),
     Error(String),
+}
+
+enum SrtJobEvent {
+    Status {
+        job_id: u64,
+        message: String,
+    },
+    Progress {
+        job_id: u64,
+        fraction: f32,
+        label: String,
+    },
+    Ready {
+        job_id: u64,
+        project_root: String,
+        audio_path: String,
+        path: PathBuf,
+        timed_lines: Vec<TimedBookLine>,
+        word_segments: Vec<TimedWordSegment>,
+    },
+    Error {
+        job_id: u64,
+        error: String,
+    },
+    Cancelled {
+        job_id: u64,
+        message: String,
+    },
+}
+
+struct SrtBackgroundJob {
+    id: u64,
+    project_root: String,
+    audio_path: String,
+    status: String,
+    progress_fraction: f32,
+    progress_label: String,
+    srt_path: String,
+    finished: bool,
+    failed: bool,
 }
 
 enum QwenEvent {
@@ -504,6 +556,30 @@ enum QwenEvent {
     Error(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum VideoTagPosition {
+    TopLeft,
+    TopCenter,
+}
+
+enum LineRenderEvent {
+    Status {
+        engine: ExportEngine,
+        index: usize,
+        message: String,
+    },
+    Rendered {
+        engine: ExportEngine,
+        speech: ExportedSpeech,
+        message: String,
+    },
+    Error {
+        engine: ExportEngine,
+        index: usize,
+        error: String,
+    },
+}
+
 struct TtsApp {
     api_key: String,
     text: String,
@@ -528,6 +604,8 @@ struct TtsApp {
     book_rx: Option<Receiver<BookEvent>>,
     character_rx: Option<Receiver<CharacterEvent>>,
     qwen_rx: Option<Receiver<QwenEvent>>,
+    line_render_tx: Sender<LineRenderEvent>,
+    line_render_rx: Receiver<LineRenderEvent>,
     cancel_flag: Arc<AtomicBool>,
     stream: Option<OutputStream>,
     sink: Option<Sink>,
@@ -551,6 +629,8 @@ struct TtsApp {
     show_analysis_panel: bool,
     qwen_status: String,
     is_qwen_busy: bool,
+    active_qwen_line_renders: usize,
+    active_gemini_line_renders: usize,
     is_exporting_book: bool,
     qwen_service_ready: bool,
     qwen_model_ready: bool,
@@ -570,6 +650,7 @@ struct TtsApp {
     export_speaker_settings: Vec<SpeakerExportSetting>,
     show_export_exclusion_picker: bool,
     show_official_export_settings: bool,
+    show_missing_audio_lines: bool,
     auto_merge_after_render: bool,
     export_progress_done: usize,
     export_progress_total: usize,
@@ -580,6 +661,10 @@ struct TtsApp {
     is_exporting_video: bool,
     video_status: String,
     video_background_path: String,
+    video_corner_tag: String,
+    video_tag_position: VideoTagPosition,
+    video_tag_font_size: u32,
+    video_tag_background_enabled: bool,
     video_font_name: String,
     video_text_color: String,
     video_card_opacity: u8,
@@ -587,6 +672,7 @@ struct TtsApp {
     video_resolution: VideoResolution,
     video_frame_rate: VideoFrameRate,
     video_rx: Option<Receiver<VideoEvent>>,
+    video_cancel_flag: Arc<AtomicBool>,
     video_preview_texture: Option<egui::TextureHandle>,
     video_preview_texture_path: String,
     video_preview_line_index: usize,
@@ -595,12 +681,18 @@ struct TtsApp {
     video_timed_lines: Vec<TimedBookLine>,
     video_word_segments: Vec<TimedWordSegment>,
     video_word_highlight_enabled: bool,
+    video_subtitle_lead_seconds: f32,
     video_srt_path: String,
     video_preview_started_at: Option<Instant>,
     video_preview_audio_path: String,
     video_preview_seek_seconds: f64,
     last_video_export_path: String,
     video_preview_clip_duration_seconds: u32,
+    srt_jobs: Vec<SrtBackgroundJob>,
+    srt_job_tx: Sender<SrtJobEvent>,
+    srt_job_rx: Receiver<SrtJobEvent>,
+    srt_job_cancel_flags: HashMap<u64, Arc<AtomicBool>>,
+    next_srt_job_id: u64,
     show_project_picker: bool,
     project_picker_selected: String,
     show_project_rename: bool,
@@ -610,6 +702,8 @@ struct TtsApp {
 impl Default for TtsApp {
     fn default() -> Self {
         let persisted = load_persisted_state().unwrap_or_default();
+        let (srt_job_tx, srt_job_rx) = mpsc::channel();
+        let (line_render_tx, line_render_rx) = mpsc::channel();
         let initial_api_key = if persisted.api_key.trim().is_empty() {
             std::env::var("GEMINI_API_KEY").unwrap_or_default()
         } else {
@@ -622,12 +716,12 @@ impl Default for TtsApp {
             style_instruction: "Read naturally, clearly, and with the right emotional context.".to_string(),
             voice_name: DEFAULT_VOICE.to_string(),
             speed: SpeechSpeed::Normal,
-            status: "Sẵn sàng.".to_string(),
+            status: "S?n s�ng.".to_string(),
             analysis_status: "Drag and drop an audio file into the analysis panel to begin.".to_string(),
             book_status: "Paste your story text here, then click process.".to_string(),
-            export_status: "Chưa xuất audio book.".to_string(),
-            export_qwen_status: "Qwen chưa xuất gì.".to_string(),
-            export_gemini_status: "Gemini chưa xuất gì.".to_string(),
+            export_status: "Chua xu?t audio book.".to_string(),
+            export_qwen_status: "Qwen chua xu?t g�.".to_string(),
+            export_gemini_status: "Gemini chua xu?t g�.".to_string(),
             character_status: "No character selected.".to_string(),
             is_fetching: false,
             is_playing: false,
@@ -639,6 +733,8 @@ impl Default for TtsApp {
             book_rx: None,
             character_rx: None,
             qwen_rx: None,
+            line_render_tx,
+            line_render_rx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stream: None,
             sink: None,
@@ -662,6 +758,8 @@ impl Default for TtsApp {
             show_analysis_panel: false,
             qwen_status: "Qwen is not ready yet.".to_string(),
             is_qwen_busy: false,
+            active_qwen_line_renders: 0,
+            active_gemini_line_renders: 0,
             is_exporting_book: false,
             qwen_service_ready: false,
             qwen_model_ready: false,
@@ -687,6 +785,7 @@ impl Default for TtsApp {
             export_speaker_settings: persisted.export_speaker_settings,
             show_export_exclusion_picker: false,
             show_official_export_settings: false,
+            show_missing_audio_lines: false,
             auto_merge_after_render: persisted.auto_merge_after_render,
             export_progress_done: 0,
             export_progress_total: 0,
@@ -697,6 +796,14 @@ impl Default for TtsApp {
             is_exporting_video: false,
             video_status: "No video exported yet.".to_string(),
             video_background_path: persisted.video_background_path,
+            video_corner_tag: persisted.video_corner_tag,
+            video_tag_position: persisted.video_tag_position,
+            video_tag_font_size: if persisted.video_tag_font_size == 0 {
+                70
+            } else {
+                persisted.video_tag_font_size.clamp(28, 120)
+            },
+            video_tag_background_enabled: persisted.video_tag_background_enabled,
             video_font_name: if persisted.video_font_name.trim().is_empty() {
                 "Tahoma".to_string()
             } else {
@@ -716,6 +823,7 @@ impl Default for TtsApp {
             video_resolution: persisted.video_resolution,
             video_frame_rate: persisted.video_frame_rate,
             video_rx: None,
+            video_cancel_flag: Arc::new(AtomicBool::new(false)),
             video_preview_texture: None,
             video_preview_texture_path: String::new(),
             video_preview_line_index: 0,
@@ -724,6 +832,9 @@ impl Default for TtsApp {
             video_timed_lines: Vec::new(),
             video_word_segments: Vec::new(),
             video_word_highlight_enabled: persisted.video_word_highlight_enabled,
+            video_subtitle_lead_seconds: persisted
+                .video_subtitle_lead_seconds
+                .clamp(0.0, 1.5),
             video_srt_path: persisted.video_srt_path,
             video_preview_started_at: None,
             video_preview_audio_path: persisted.video_preview_audio_path,
@@ -732,6 +843,11 @@ impl Default for TtsApp {
             video_preview_clip_duration_seconds: persisted
                 .video_preview_clip_duration_seconds
                 .clamp(3, 90),
+            srt_jobs: Vec::new(),
+            srt_job_tx,
+            srt_job_rx,
+            srt_job_cancel_flags: HashMap::new(),
+            next_srt_job_id: 1,
             show_project_picker: false,
             project_picker_selected: if persisted.last_export_dir.trim().is_empty() {
                 String::new()
@@ -744,9 +860,18 @@ impl Default for TtsApp {
             project_rename_input: String::new(),
         };
 
-        let default_project = list_available_project_dirs()
-            .ok()
-            .and_then(|projects| projects.into_iter().last());
+        let persisted_project = if persisted.last_export_dir.trim().is_empty() {
+            None
+        } else {
+            let path = normalize_project_root(Path::new(&persisted.last_export_dir));
+            path.exists().then_some(path)
+        };
+
+        let default_project = persisted_project.or_else(|| {
+            list_available_project_dirs()
+                .ok()
+                .and_then(|projects| projects.into_iter().last())
+        });
 
         match default_project
             .map(Ok)
@@ -768,6 +893,89 @@ impl Default for TtsApp {
 }
 
 impl TtsApp {
+    fn poll_line_render_events(&mut self) {
+        loop {
+            match self.line_render_rx.try_recv() {
+                Ok(event) => match event {
+                    LineRenderEvent::Status {
+                        engine,
+                        index,
+                        message,
+                    } => {
+                        self.export_status = message.clone();
+                        match engine {
+                            ExportEngine::Qwen => {
+                                self.export_qwen_status =
+                                    format!("Rendering line {} with Qwen...", index + 1);
+                                self.qwen_status = self.export_qwen_status.clone();
+                            }
+                            ExportEngine::Gemini => {
+                                self.export_gemini_status =
+                                    format!("Rendering line {} with Gemini...", index + 1);
+                                self.qwen_status = self.export_gemini_status.clone();
+                            }
+                        }
+                    }
+                    LineRenderEvent::Rendered {
+                        engine,
+                        speech,
+                        message,
+                    } => {
+                        self.exported_speeches.retain(|item| item.index != speech.index);
+                        self.exported_speeches.push(speech.clone());
+                        self.exported_speeches.sort_by_key(|item| item.index);
+                        self.export_skipped_indices.retain(|item| *item != speech.index);
+                        self.export_skip_details.retain(|detail| {
+                            !detail.contains(&format!("line {}", speech.index + 1))
+                                && !detail.contains(&format!("Dòng {}", speech.index + 1))
+                        });
+                        self.export_status = message.clone();
+                        match engine {
+                            ExportEngine::Qwen => {
+                                self.active_qwen_line_renders =
+                                    self.active_qwen_line_renders.saturating_sub(1);
+                                self.export_qwen_status = message.clone();
+                                self.qwen_status = self.export_qwen_status.clone();
+                            }
+                            ExportEngine::Gemini => {
+                                self.active_gemini_line_renders =
+                                    self.active_gemini_line_renders.saturating_sub(1);
+                                self.export_gemini_status = message.clone();
+                                self.qwen_status = self.export_gemini_status.clone();
+                            }
+                        }
+                        let _ = self.persist_state_to_disk();
+                    }
+                    LineRenderEvent::Error {
+                        engine,
+                        index,
+                        error,
+                    } => {
+                        self.export_status = format!("Render line failed: {}", error);
+                        match engine {
+                            ExportEngine::Qwen => {
+                                self.active_qwen_line_renders =
+                                    self.active_qwen_line_renders.saturating_sub(1);
+                                self.export_qwen_status =
+                                    format!("Line {} failed: {}", index + 1, error);
+                                self.qwen_status = self.export_qwen_status.clone();
+                            }
+                            ExportEngine::Gemini => {
+                                self.active_gemini_line_renders =
+                                    self.active_gemini_line_renders.saturating_sub(1);
+                                self.export_gemini_status =
+                                    format!("Line {} failed: {}", index + 1, error);
+                                self.qwen_status = self.export_gemini_status.clone();
+                            }
+                        }
+                    }
+                },
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
 
@@ -777,28 +985,28 @@ impl TtsApp {
                     self.dropped_audio_path = Some(path.clone());
                     self.character_ref_audio_input = path.to_string_lossy().to_string();
                     self.analysis_status =
-                        format!("Đã nhận file audio: {}", path.to_string_lossy());
+                        format!("�� nh?n file audio: {}", path.to_string_lossy());
                     self.character_status =
-                        "Đã nhận audio mẫu và gán vào nhân vật hiện tại.".to_string();
+                        "�� nh?n audio m?u v� g�n v�o nh�n v?t hi?n t?i.".to_string();
                 } else if is_supported_srt_file(&path) {
                     match self.load_video_srt_from_path(&path) {
                         Ok(()) => {
                             self.show_video_window = true;
                         }
                         Err(err) => {
-                            self.video_status = format!("Không nạp được SRT: {}", err);
+                            self.video_status = format!("Kh�ng n?p du?c SRT: {}", err);
                         }
                     }
                 } else if is_supported_image_file(&path) {
                     self.video_background_path = path.to_string_lossy().to_string();
                     self.video_status =
-                        format!("Đã nhận ảnh nền video: {}", path.to_string_lossy());
+                        format!("�� nh?n ?nh n?n video: {}", path.to_string_lossy());
                     self.video_preview_texture = None;
                     self.video_preview_texture_path.clear();
                     let _ = self.persist_state_to_disk();
                 } else {
                     self.analysis_status = format!(
-                        "File không được hỗ trợ: {}. Dùng mp3, wav, m4a, flac, ogg, webm, aac.",
+                        "File kh�ng du?c h? tr?: {}. D�ng mp3, wav, m4a, flac, ogg, webm, aac.",
                         path.to_string_lossy()
                     );
                 }
@@ -837,9 +1045,43 @@ impl TtsApp {
         self.last_audiobook_path.clear();
         self.selected_book_line = Some(index);
         self.export_status = format!(
-            "Đã đổi speaker dòng {} thành '{}'. Cache audio cũ đã bị xóa để tránh lệch thứ tự, cần render lại.",
+            "�� d?i speaker d�ng {} th�nh '{}'. Cache audio cu d� b? x�a d? tr�nh l?ch th? t?, c?n render l?i.",
             index + 1,
             normalized
+        );
+        let _ = self.persist_state_to_disk();
+    }
+
+    fn set_book_line_text(&mut self, index: usize, text: &str) {
+        let mut lines = parse_book_lines(&self.book_output);
+        let Some(line) = lines.get_mut(index) else {
+            return;
+        };
+        let normalized = text.trim().to_string();
+        if normalized.is_empty() || normalized == line.text {
+            return;
+        }
+
+        line.text = normalized.clone();
+        self.book_output = serialize_book_lines(&lines);
+        self.exported_speeches.retain(|item| item.index != index);
+        self.export_skip_details
+            .retain(|item| !item.starts_with(&format!("D?ng {} ", index + 1)));
+        self.export_skipped_indices.retain(|item| *item != index);
+        let cache_path = app_data_dir()
+            .join("speech-cache")
+            .join("latest")
+            .join(format!("{:04}.wav", index + 1));
+        let _ = fs::remove_file(cache_path);
+        self.last_audiobook_path.clear();
+        self.video_srt_path.clear();
+        self.video_timed_lines.clear();
+        self.video_word_segments.clear();
+        self.last_video_export_path.clear();
+        self.selected_book_line = Some(index);
+        self.export_status = format!(
+            "Updated text for line {}. Cached speech for this line was cleared, and the merged audiobook/subtitles must be rebuilt.",
+            index + 1
         );
         let _ = self.persist_state_to_disk();
     }
@@ -860,7 +1102,7 @@ impl TtsApp {
             Err(err) => {
                 self.video_preview_texture = None;
                 self.video_preview_texture_path.clear();
-                self.video_status = format!("Không đọc được ảnh nền video: {}", err);
+                self.video_status = format!("Kh�ng d?c du?c ?nh n?n video: {}", err);
                 return;
             }
         };
@@ -876,9 +1118,9 @@ impl TtsApp {
     fn load_video_srt_from_path(&mut self, path: &Path) -> Result<()> {
         let mut timed_lines = parse_srt_file(path)?;
         if timed_lines.is_empty() {
-            return Err(anyhow!("File SRT không có segment hợp lệ."));
+            return Err(anyhow!("File SRT kh�ng c� segment h?p l?."));
         }
-        apply_subtitle_lead_to_lines(&mut timed_lines, VIDEO_SUBTITLE_LEAD_SECONDS);
+        apply_subtitle_lead_to_lines(&mut timed_lines, self.video_subtitle_lead_seconds as f64);
         self.video_timed_lines = timed_lines;
         self.video_srt_path = path.to_string_lossy().to_string();
         let root = normalize_project_root(path);
@@ -897,7 +1139,10 @@ impl TtsApp {
         let word_path = word_timing_path_for_srt(path);
         self.video_word_segments = if self.video_word_highlight_enabled && word_path.exists() {
             let mut segments = load_word_timing_file(&word_path).unwrap_or_default();
-            apply_subtitle_lead_to_word_segments(&mut segments, VIDEO_SUBTITLE_LEAD_SECONDS);
+            apply_subtitle_lead_to_word_segments(
+                &mut segments,
+                self.video_subtitle_lead_seconds as f64,
+            );
             segments
         } else {
             Vec::new()
@@ -908,14 +1153,14 @@ impl TtsApp {
         if let Some(audio_path) = find_preview_audio_for_srt(path) {
             self.video_preview_audio_path = audio_path.to_string_lossy().to_string();
             self.video_status = format!(
-                "Đã nạp SRT: {}. Đã tìm thấy audio preview: {}",
+                "�� n?p SRT: {}. �� t�m th?y audio preview: {}",
                 path.display(),
                 audio_path.display()
             );
         } else {
             self.video_preview_audio_path.clear();
             self.video_status = format!(
-                "Đã nạp SRT: {}. Chưa tìm thấy audiobook cạnh file SRT.",
+                "�� n?p SRT: {}. Chua t�m th?y audiobook c?nh file SRT.",
                 path.display()
             );
         }
@@ -940,7 +1185,7 @@ impl TtsApp {
 
         let lines = parse_book_lines(&self.book_output);
         if lines.is_empty() {
-            return vec!["Chưa có dòng thoại để preview.".to_string()];
+            return vec!["Chua c� d�ng tho?i d? preview.".to_string()];
         }
 
         let index = self.video_preview_line_index.min(lines.len() - 1);
@@ -1006,13 +1251,13 @@ impl TtsApp {
         let old_root = self.current_project_root()?;
         let parent = old_root
             .parent()
-            .ok_or_else(|| anyhow!("Không xác định được thư mục cha của project hiện tại."))?;
+            .ok_or_else(|| anyhow!("Kh�ng x�c d?nh du?c thu m?c cha c?a project hi?n t?i."))?;
         let trimmed = new_name.trim();
         if trimmed.is_empty() {
-            return Err(anyhow!("Tên project mới không được để trống."));
+            return Err(anyhow!("T�n project m?i kh�ng du?c d? tr?ng."));
         }
         if trimmed.chars().any(|ch| "<>:\"/\\|?*".contains(ch)) {
-            return Err(anyhow!("Tên project mới có ký tự không hợp lệ."));
+            return Err(anyhow!("T�n project m?i c� k� t? kh�ng h?p l?."));
         }
 
         let current_name = old_root
@@ -1026,20 +1271,20 @@ impl TtsApp {
         let new_root = parent.join(trimmed);
         if new_root.exists() {
             return Err(anyhow!(
-                "Project '{}' đã tồn tại, hãy chọn tên khác.",
+                "Project '{}' d� t?n t?i, h�y ch?n t�n kh�c.",
                 trimmed
             ));
         }
 
         fs::rename(&old_root, &new_root).with_context(|| {
             format!(
-                "Không đổi tên được project {} -> {}",
+                "Kh�ng d?i t�n du?c project {} -> {}",
                 old_root.display(),
                 new_root.display()
             )
         })?;
         self.load_project(&new_root)?;
-        self.status = format!("Đã đổi tên project thành '{}'.", trimmed);
+        self.status = format!("�� d?i t�n project th�nh '{}'.", trimmed);
         Ok(())
     }
 
@@ -1058,7 +1303,7 @@ impl TtsApp {
         }
     }
 
-    fn video_srt_matches_audio(&self, audio_path: &Path) -> Result<()> {
+    fn video_srt_matches_audio(&mut self, audio_path: &Path) -> Result<()> {
         if self.video_srt_path.trim().is_empty() {
             return Err(anyhow!("Ch?a co SRT cho audio moi nhat. Hay bam Tao SRT truoc."));
         }
@@ -1066,10 +1311,20 @@ impl TtsApp {
         if !srt_path.exists() {
             return Err(anyhow!("File SRT hien tai khong ton tai. Hay Tao SRT lai."));
         }
-        if self.video_preview_audio_path.trim().is_empty() {
-            return Err(anyhow!("SRT hien tai chua gan voi audio nao. Hay Tao SRT lai."));
-        }
-        let bound_audio = PathBuf::from(self.video_preview_audio_path.trim());
+        let same_project = normalize_separators(&normalize_project_root(&srt_path))
+            == normalize_separators(&normalize_project_root(audio_path));
+        let bound_audio = if self.video_preview_audio_path.trim().is_empty() {
+            if let Some(path) = find_preview_audio_for_srt(&srt_path) {
+                self.video_preview_audio_path = path.to_string_lossy().to_string();
+                path
+            } else if same_project {
+                audio_path.to_path_buf()
+            } else {
+                return Err(anyhow!("SRT hien tai chua gan voi audio nao. Hay Tao SRT lai."));
+            }
+        } else {
+            PathBuf::from(self.video_preview_audio_path.trim())
+        };
         if normalize_separators(&bound_audio) != normalize_separators(audio_path) {
             return Err(anyhow!(
                 "SRT hien tai ?ang thuoc audio c?. Hay Tao SRT lai cho audio moi nhat: {}",
@@ -1090,20 +1345,34 @@ impl TtsApp {
 
     fn start_video_export(&mut self) {
         if !self.can_export_video() {
-            self.video_status = "Ch?a d? speech cache d? xu?t video.".to_string();
+            self.video_status = "Speech cache is incomplete. Video export is unavailable.".to_string();
             return;
         }
-
-        if self.last_audiobook_path.trim().is_empty() || !Path::new(&self.last_audiobook_path).exists() {
-            if let Err(err) = self.rebuild_audiobook_from_cache() {
-                self.video_status = format!("Ch?a gh?p ???c audiobook ?? xu?t video: {}", err);
+        let current_project_root = if self.last_export_dir.trim().is_empty() {
+            match next_project_root_dir() {
+                Ok(dir) => dir,
+                Err(err) => {
+                    self.video_status = format!("Could not resolve the current project: {}", err);
+                    return;
+                }
+            }
+        } else {
+            normalize_project_root(Path::new(&self.last_export_dir))
+        };
+        let audiobook_path = match self.resolve_latest_project_audiobook(&current_project_root) {
+            Ok(path) => path,
+            Err(err) => {
+                self.video_status = format!("Could not prepare the latest audiobook: {}", err);
                 return;
             }
+        };
+        if let Err(err) = self.video_srt_matches_audio(&audiobook_path) {
+            self.video_status = err.to_string();
+            return;
         }
 
         let lines = parse_book_lines(&self.book_output);
         let speeches = self.exported_speeches.clone();
-        let audiobook_path = PathBuf::from(self.last_audiobook_path.clone());
         let output_dir = if self.last_export_dir.trim().is_empty() {
             match next_project_root_dir() {
                 Ok(dir) => {
@@ -1132,10 +1401,15 @@ impl TtsApp {
         let text_color = self.video_text_color.trim().to_string();
         let card_opacity = self.video_card_opacity;
         let font_size = self.video_font_size.clamp(20, 96);
+        let corner_tag = self.video_corner_tag.trim().to_string();
+        let tag_font_size = self.video_tag_font_size.clamp(36, 120);
+        let tag_background_enabled = self.video_tag_background_enabled;
+        let tag_position = self.video_tag_position;
         let resolution = self.video_resolution;
         let frame_rate = self.video_frame_rate;
         let pause_ms = self.audiobook_pause_ms;
         let enable_word_highlight = self.video_word_highlight_enabled;
+        let subtitle_lead_seconds = self.video_subtitle_lead_seconds as f64;
         let api_key = self.api_key.trim().to_string();
         let cached_timed_lines = self.video_timed_lines.clone();
         let cached_word_segments = self.video_word_segments.clone();
@@ -1143,15 +1417,17 @@ impl TtsApp {
         let cached_audio_path = self.video_preview_audio_path.clone();
 
         self.is_exporting_video = true;
-        self.video_status = "?ang chu?n b? xu?t video...".to_string();
+        self.video_cancel_flag = Arc::new(AtomicBool::new(false));
+        self.video_status = "Preparing video export...".to_string();
         self.video_progress_fraction = 0.0;
-        self.video_progress_label = "Chu?n b? video...".to_string();
+        self.video_progress_label = "Preparing video...".to_string();
         let (tx, rx) = mpsc::channel();
         self.video_rx = Some(rx);
         let progress_tx = tx.clone();
+        let cancel_flag = self.video_cancel_flag.clone();
 
         thread::spawn(move || {
-            let _ = tx.send(VideoEvent::Status("?ang d?ng timeline t? speech cache...".to_string()));
+            let _ = tx.send(VideoEvent::Status("Building subtitle timeline from speech cache...".to_string()));
             let result = export_video_from_cache(
                 &lines,
                 &speeches,
@@ -1162,6 +1438,10 @@ impl TtsApp {
                 &text_color,
                 card_opacity,
                 font_size,
+                &corner_tag,
+                tag_font_size,
+                tag_background_enabled,
+                tag_position,
                 resolution,
                 frame_rate,
                 pause_ms,
@@ -1171,6 +1451,8 @@ impl TtsApp {
                 &cached_word_segments,
                 &cached_srt_path,
                 &cached_audio_path,
+                subtitle_lead_seconds,
+                &cancel_flag,
                 progress_tx,
             );
 
@@ -1179,7 +1461,11 @@ impl TtsApp {
                     let _ = tx.send(VideoEvent::Done(path));
                 }
                 Err(err) => {
-                    let _ = tx.send(VideoEvent::Error(err.to_string()));
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        let _ = tx.send(VideoEvent::Cancelled("Video export cancelled.".to_string()));
+                    } else {
+                        let _ = tx.send(VideoEvent::Error(err.to_string()));
+                    }
                 }
             }
         });
@@ -1187,7 +1473,7 @@ impl TtsApp {
 
     fn start_video_preview_export(&mut self) {
         if !self.can_export_video() {
-            self.video_status = "Ch?a d? speech cache d? xu?t preview video.".to_string();
+            self.video_status = "Speech cache is incomplete. Preview export is unavailable.".to_string();
             return;
         }
 
@@ -1213,15 +1499,17 @@ impl TtsApp {
             self.video_status = format!("Kh?ng chuan bi duoc project de xuat preview: {}", err);
             return;
         }
-        let audiobook_path = if !self.last_audiobook_path.trim().is_empty() {
-            PathBuf::from(self.last_audiobook_path.clone())
-        } else {
-            if let Err(err) = self.rebuild_audiobook_from_cache() {
-                self.video_status = format!("Ch?a gh?p ???c audiobook ?? xu?t preview: {}", err);
+        let audiobook_path = match self.resolve_latest_project_audiobook(&output_dir) {
+            Ok(path) => path,
+            Err(err) => {
+                self.video_status = format!("Could not prepare the latest audiobook: {}", err);
                 return;
             }
-            PathBuf::from(self.last_audiobook_path.clone())
         };
+        if let Err(err) = self.video_srt_matches_audio(&audiobook_path) {
+            self.video_status = err.to_string();
+            return;
+        }
 
         let start_seconds = self.video_preview_seek_seconds.max(0.0);
         let duration_seconds = self.video_preview_clip_duration_seconds.clamp(3, 90) as f64;
@@ -1229,6 +1517,10 @@ impl TtsApp {
         let text_color = self.video_text_color.trim().to_string();
         let card_opacity = self.video_card_opacity;
         let font_size = self.video_font_size.clamp(20, 96);
+        let corner_tag = self.video_corner_tag.trim().to_string();
+        let tag_font_size = self.video_tag_font_size.clamp(36, 120);
+        let tag_background_enabled = self.video_tag_background_enabled;
+        let tag_position = self.video_tag_position;
         let resolution = self.video_resolution;
         let frame_rate = self.video_frame_rate;
         let background_path = trimmed_path(&self.video_background_path);
@@ -1236,15 +1528,17 @@ impl TtsApp {
         let word_segments = self.video_word_segments.clone();
 
         self.is_exporting_video = true;
-        self.video_status = "?ang xu?t preview video...".to_string();
+        self.video_cancel_flag = Arc::new(AtomicBool::new(false));
+        self.video_status = "Exporting preview video...".to_string();
         self.video_progress_fraction = 0.0;
-        self.video_progress_label = "Chu?n b? preview clip...".to_string();
+        self.video_progress_label = "Preparing preview clip...".to_string();
         let (tx, rx) = mpsc::channel();
         self.video_rx = Some(rx);
+        let cancel_flag = self.video_cancel_flag.clone();
 
         thread::spawn(move || {
             let _ = tx.send(VideoEvent::Status(format!(
-                "?ang xu?t preview t? {:.1}s trong {} gi?y...",
+                "Exporting preview from {:.1}s for {} seconds...",
                 start_seconds, duration_seconds as u32
             )));
             let result = export_video_preview_segment(
@@ -1256,11 +1550,16 @@ impl TtsApp {
                 &text_color,
                 card_opacity,
                 font_size,
+                &corner_tag,
+                tag_font_size,
+                tag_background_enabled,
+                tag_position,
                 resolution,
                 frame_rate,
                 &word_segments,
                 start_seconds,
                 duration_seconds,
+                &cancel_flag,
                 tx.clone(),
             );
             match result {
@@ -1268,7 +1567,11 @@ impl TtsApp {
                     let _ = tx.send(VideoEvent::Done(path));
                 }
                 Err(err) => {
-                    let _ = tx.send(VideoEvent::Error(err.to_string()));
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        let _ = tx.send(VideoEvent::Cancelled("Preview export cancelled.".to_string()));
+                    } else {
+                        let _ = tx.send(VideoEvent::Error(err.to_string()));
+                    }
                 }
             }
         });
@@ -1276,24 +1579,35 @@ impl TtsApp {
 
     fn start_generate_video_srt(&mut self) {
         if !self.can_export_video() {
-            self.video_status = "Ch?a d? speech cache d? t?o SRT.".to_string();
+            self.video_status = "Speech cache is incomplete. Cannot create SRT yet.".to_string();
             return;
         }
-        if self.last_audiobook_path.trim().is_empty() || !Path::new(&self.last_audiobook_path).exists() {
-            if let Err(err) = self.rebuild_audiobook_from_cache() {
-                self.video_status = format!("Ch?a gh?p ???c audiobook ?? t?o SRT: {}", err);
+        let current_project_root = if self.last_export_dir.trim().is_empty() {
+            match next_project_root_dir() {
+                Ok(dir) => dir,
+                Err(err) => {
+                    self.video_status = format!("Could not resolve the current project: {}", err);
+                    return;
+                }
+            }
+        } else {
+            normalize_project_root(Path::new(&self.last_export_dir))
+        };
+        let audiobook_path = match self.resolve_latest_project_audiobook(&current_project_root) {
+            Ok(path) => path,
+            Err(err) => {
+                self.video_status = format!("Could not prepare the latest audiobook: {}", err);
                 return;
             }
-        }
+        };
         let api_key = self.api_key.trim().to_string();
         if api_key.is_empty() {
-            self.video_status = "Thi?u Gemini API key d? t?o SRT.".to_string();
+            self.video_status = "Missing Gemini API key for SRT creation.".to_string();
             return;
         }
 
         let lines = parse_book_lines(&self.book_output);
         let speeches = self.exported_speeches.clone();
-        let audiobook_path = PathBuf::from(self.last_audiobook_path.clone());
         let output_dir = if self.last_export_dir.trim().is_empty() {
             match next_project_root_dir() {
                 Ok(dir) => {
@@ -1301,7 +1615,7 @@ impl TtsApp {
                     dir
                 }
                 Err(err) => {
-                    self.video_status = format!("Kh?ng tao duoc project de tao SRT: {}", err);
+                    self.video_status = format!("Could not create a project folder for SRT: {}", err);
                     return;
                 }
             }
@@ -1313,22 +1627,43 @@ impl TtsApp {
         if let Err(err) = ensure_project_structure(&output_dir)
             .and_then(|_| write_project_text_files(&output_dir, &self.book_input, &self.book_output))
         {
-            self.video_status = format!("Kh?ng chuan bi duoc project de tao SRT: {}", err);
+            self.video_status = format!("Could not prepare the project for SRT creation: {}", err);
             return;
         }
         let pause_ms = self.audiobook_pause_ms;
         let enable_word_highlight = self.video_word_highlight_enabled;
-
-        self.is_exporting_video = true;
-        self.video_status = "?ang t?o SRT b?ng Gemini...".to_string();
-        self.video_progress_fraction = 0.0;
-        self.video_progress_label = "Chu?n b? SRT...".to_string();
-        let (tx, rx) = mpsc::channel();
-        self.video_rx = Some(rx);
+        let subtitle_lead_seconds = self.video_subtitle_lead_seconds as f64;
+        let job_id = self.next_srt_job_id;
+        self.next_srt_job_id += 1;
+        let project_root_string = output_dir.to_string_lossy().to_string();
+        let audio_path_string = audiobook_path.to_string_lossy().to_string();
+        self.srt_jobs.push(SrtBackgroundJob {
+            id: job_id,
+            project_root: project_root_string.clone(),
+            audio_path: audio_path_string.clone(),
+            status: "Queued SRT generation".to_string(),
+            progress_fraction: 0.0,
+            progress_label: "Queued".to_string(),
+            srt_path: String::new(),
+            finished: false,
+            failed: false,
+        });
+        self.video_status = format!(
+            "Started background SRT job #{} for {}",
+            job_id,
+            audiobook_path.display()
+        );
+        let tx = self.srt_job_tx.clone();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.srt_job_cancel_flags.insert(job_id, cancel_flag.clone());
 
         thread::spawn(move || {
-            let _ = tx.send(VideoEvent::Status("?ang d?ng danh s?ch c?u cho SRT...".to_string()));
-            let result = build_video_srt_with_gemini(
+            let _ = tx.send(SrtJobEvent::Status {
+                job_id,
+                message: "Preparing sentence list for SRT...".to_string(),
+            });
+            let result = build_video_srt_with_gemini_background(
+                job_id,
                 &api_key,
                 &lines,
                 &speeches,
@@ -1336,18 +1671,33 @@ impl TtsApp {
                 &output_dir,
                 pause_ms,
                 enable_word_highlight,
+                subtitle_lead_seconds,
+                &cancel_flag,
                 tx.clone(),
             );
             match result {
                 Ok((path, timed_lines, word_segments)) => {
-                    let _ = tx.send(VideoEvent::SrtReady {
+                    let _ = tx.send(SrtJobEvent::Ready {
+                        job_id,
+                        project_root: project_root_string,
+                        audio_path: audio_path_string,
                         path,
                         timed_lines,
                         word_segments,
                     });
                 }
                 Err(err) => {
-                    let _ = tx.send(VideoEvent::Error(err.to_string()));
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        let _ = tx.send(SrtJobEvent::Cancelled {
+                            job_id,
+                            message: "SRT generation cancelled.".to_string(),
+                        });
+                    } else {
+                        let _ = tx.send(SrtJobEvent::Error {
+                            job_id,
+                            error: err.to_string(),
+                        });
+                    }
                 }
             }
         });
@@ -1523,6 +1873,39 @@ impl TtsApp {
         missing
     }
 
+    fn missing_cached_book_lines(&self) -> Vec<(usize, BookLine)> {
+        let lines = parse_book_lines(&self.book_output);
+        self.missing_cached_book_line_indices()
+            .into_iter()
+            .filter_map(|index| lines.get(index).cloned().map(|line| (index, line)))
+            .collect()
+    }
+
+    fn missing_renderable_book_line_indices(&self) -> Vec<usize> {
+        let lines = parse_book_lines(&self.book_output);
+        self.missing_cached_book_line_indices()
+            .into_iter()
+            .filter(|index| {
+                lines.get(*index)
+                    .map(|line| self.effective_speaker_export_mode(&line.speaker) != SpeakerExportMode::Exclude)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    fn missing_renderable_book_lines(&self) -> Vec<(usize, BookLine)> {
+        let lines = parse_book_lines(&self.book_output);
+        self.missing_renderable_book_line_indices()
+            .into_iter()
+            .filter_map(|index| lines.get(index).cloned().map(|line| (index, line)))
+            .collect()
+    }
+
+    fn can_export_full_audio(&self) -> bool {
+        !parse_book_lines(&self.book_output).is_empty()
+            && self.missing_cached_book_line_indices().is_empty()
+    }
+
     fn rebuild_audiobook_from_cache(&mut self) -> Result<()> {
         let lines = parse_book_lines(&self.book_output);
         if lines.is_empty() {
@@ -1562,9 +1945,23 @@ impl TtsApp {
             .iter()
             .map(|item| PathBuf::from(item.audio_path.clone()))
             .collect::<Vec<_>>();
+        let previous_audiobook_path = self.last_audiobook_path.clone();
         let audiobook_path = next_numbered_file_path(&project_audio_dir(&output_dir), "audio", "wav")?;
         merge_wav_files(&paths, &audiobook_path, self.audiobook_pause_ms)?;
         self.last_audiobook_path = audiobook_path.to_string_lossy().to_string();
+        self.video_preview_audio_path = self.last_audiobook_path.clone();
+        if normalize_separators(Path::new(&previous_audiobook_path))
+            != normalize_separators(Path::new(&self.last_audiobook_path))
+        {
+            clear_directory_files(&project_subtitle_dir(&output_dir))?;
+            self.video_srt_path.clear();
+            self.video_timed_lines.clear();
+            self.video_word_segments.clear();
+            self.last_video_export_path.clear();
+            self.video_status =
+                "Audiobook rebuilt. Old subtitle files were cleared. Create a new SRT."
+                    .to_string();
+        }
         let _ = self.persist_state_to_disk();
         Ok(())
     }
@@ -1585,6 +1982,23 @@ impl TtsApp {
         self.export_status = "?ang d?ng xu?t audio book...".to_string();
         self.export_qwen_status = "Qwen ?ang d?ng...".to_string();
         self.export_gemini_status = "Gemini ?ang d?ng...".to_string();
+    }
+
+    fn stop_video_job(&mut self) {
+        self.video_cancel_flag.store(true, Ordering::SeqCst);
+        self.video_status = "Stopping video job...".to_string();
+        self.video_progress_label = "Stopping video job...".to_string();
+    }
+
+    fn stop_srt_job(&mut self, job_id: u64) {
+        if let Some(flag) = self.srt_job_cancel_flags.get(&job_id) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(job) = self.srt_jobs.iter_mut().find(|job| job.id == job_id) {
+            job.status = "Stopping SRT job...".to_string();
+            job.progress_label = "Stopping...".to_string();
+        }
+        self.video_status = format!("Stopping SRT job #{}...", job_id);
     }
 
     fn load_project(&mut self, root: &Path) -> Result<()> {
@@ -1848,6 +2262,10 @@ impl TtsApp {
             export_speaker_settings: self.export_speaker_settings.clone(),
             auto_merge_after_render: self.auto_merge_after_render,
             video_background_path: self.video_background_path.clone(),
+            video_corner_tag: self.video_corner_tag.clone(),
+            video_tag_position: self.video_tag_position,
+            video_tag_font_size: self.video_tag_font_size,
+            video_tag_background_enabled: self.video_tag_background_enabled,
             video_font_name: self.video_font_name.clone(),
             video_text_color: self.video_text_color.clone(),
             video_card_opacity: self.video_card_opacity,
@@ -1860,6 +2278,7 @@ impl TtsApp {
             video_preview_audio_path: self.video_preview_audio_path.clone(),
             video_preview_clip_duration_seconds: self.video_preview_clip_duration_seconds,
             video_word_highlight_enabled: self.video_word_highlight_enabled,
+            video_subtitle_lead_seconds: self.video_subtitle_lead_seconds,
         }
     }
 
@@ -2031,7 +2450,6 @@ impl TtsApp {
         };
 
         self.selected_book_line = Some(index);
-        self.is_qwen_busy = true;
         self.qwen_status = format!("?ang render ri?ng d?ng {}...", index + 1);
         self.export_status = format!("Rendering line {}...", index + 1);
         let final_gain_percent =
@@ -2041,10 +2459,9 @@ impl TtsApp {
             .join("speech-cache")
             .join("latest")
             .join(format!("{:04}.wav", index + 1));
-        let (tx, rx) = mpsc::channel();
-        self.qwen_rx = Some(rx);
 
         if character.tts_engine == "gemini" {
+            self.active_gemini_line_renders += 1;
             self.export_gemini_status = format!("Rendering line {} with Gemini...", index + 1);
             self.export_qwen_status = "Qwen idle.".to_string();
             let api_key = self.api_key.trim().to_string();
@@ -2053,11 +2470,13 @@ impl TtsApp {
             } else {
                 character.gemini_voice.clone()
             };
+            let tx = self.line_render_tx.clone();
             thread::spawn(move || {
-                let _ = tx.send(QwenEvent::Status(format!(
-                    "?ang render Gemini cho d?ng {}...",
-                    index + 1
-                )));
+                let _ = tx.send(LineRenderEvent::Status {
+                    engine: ExportEngine::Gemini,
+                    index,
+                    message: format!("Rendering Gemini for line {}...", index + 1),
+                });
                 let result = run_tts_job_resilient(&TtsJob {
                     api_key,
                     text: line.text.clone(),
@@ -2082,25 +2501,27 @@ impl TtsApp {
 
                 match result {
                     Ok(speech) => {
-                        let _ = tx.send(QwenEvent::LineRendered {
+                        let _ = tx.send(LineRenderEvent::Rendered {
+                            engine: ExportEngine::Gemini,
                             speech,
-                            message: format!("?? render xong d?ng {} b?ng Gemini.", index + 1),
+                            message: format!("Rendered line {} with Gemini.", index + 1),
                         });
                     }
                     Err(err) => {
-                        let _ = tx.send(QwenEvent::Error(format!(
-                            "Render d?ng {} th?t b?i: {}",
-                            index + 1,
-                            err
-                        )));
+                        let _ = tx.send(LineRenderEvent::Error {
+                            engine: ExportEngine::Gemini,
+                            index,
+                            error: format!("Render d?ng {} th?t b?i: {}", index + 1, err),
+                        });
                     }
                 }
             });
         } else {
+            self.active_qwen_line_renders += 1;
             self.export_qwen_status = format!("Rendering line {} with Qwen...", index + 1);
             self.export_gemini_status = "Gemini idle.".to_string();
             if !self.qwen_service_ready {
-                self.is_qwen_busy = false;
+                self.active_qwen_line_renders = self.active_qwen_line_renders.saturating_sub(1);
                 self.qwen_status =
                     "Qwen Service chua ch?y. H?y b?m 'Kh?i d?ng Qwen Service'.".to_string();
                 self.export_status = self.qwen_status.clone();
@@ -2109,16 +2530,18 @@ impl TtsApp {
             let language = self.qwen_language.clone();
             let xvector_only = self.qwen_xvector_only;
             let Some(service_url) = primary_qwen_service_url() else {
-                self.is_qwen_busy = false;
+                self.active_qwen_line_renders = self.active_qwen_line_renders.saturating_sub(1);
                 self.qwen_status = "Kh?ng t?m th?y Qwen Service s?n s?ng.".to_string();
                 self.export_status = self.qwen_status.clone();
                 return;
             };
+            let tx = self.line_render_tx.clone();
             thread::spawn(move || {
-                let _ = tx.send(QwenEvent::Status(format!(
-                    "?ang render Qwen cho d?ng {}...",
-                    index + 1
-                )));
+                let _ = tx.send(LineRenderEvent::Status {
+                    engine: ExportEngine::Qwen,
+                    index,
+                    message: format!("Rendering Qwen for line {}...", index + 1),
+                });
                 let temp_dir = app_data_dir()
                     .join("tmp")
                     .join(format!("line_render_{}_{}", index + 1, current_timestamp_ms()));
@@ -2148,17 +2571,18 @@ impl TtsApp {
 
                 match result {
                     Ok(speech) => {
-                        let _ = tx.send(QwenEvent::LineRendered {
+                        let _ = tx.send(LineRenderEvent::Rendered {
+                            engine: ExportEngine::Qwen,
                             speech,
-                            message: format!("?? render xong d?ng {} b?ng Qwen.", index + 1),
+                            message: format!("Rendered line {} with Qwen.", index + 1),
                         });
                     }
                     Err(err) => {
-                        let _ = tx.send(QwenEvent::Error(format!(
-                            "Render d?ng {} th?t b?i: {}",
-                            index + 1,
-                            err
-                        )));
+                        let _ = tx.send(LineRenderEvent::Error {
+                            engine: ExportEngine::Qwen,
+                            index,
+                            error: format!("Render d?ng {} th?t b?i: {}", index + 1, err),
+                        });
                     }
                 }
             });
@@ -2583,25 +3007,25 @@ impl TtsApp {
         volume_percent: u32,
     ) {
         if !self.qwen_service_ready {
-            self.qwen_status = "Qwen Service chua ch?y. H?y b?m 'Kh?i d?ng Qwen Service'.".to_string();
+            self.qwen_status = "Qwen Service is not running. Click 'Start Qwen Service'.".to_string();
             return;
         }
         if ref_audio_path.trim().is_empty() {
-            self.qwen_status = "Nh?n v?t ch?a c? ref audio.".to_string();
+            self.qwen_status = "The character has no ref audio.".to_string();
             return;
         }
         if target_text.trim().is_empty() {
-            self.qwen_status = "Kh?ng c? n?i dung ?? preview.".to_string();
+            self.qwen_status = "No text available for preview.".to_string();
             return;
         }
 
         self.is_qwen_busy = true;
-        self.qwen_status = "?ang t?o preview b?ng Qwen...".to_string();
+        self.qwen_status = "Creating preview with Qwen...".to_string();
         let language = self.qwen_language.clone();
         let xvector_only = self.qwen_xvector_only;
         let Some(service_url) = primary_qwen_service_url() else {
             self.is_qwen_busy = false;
-            self.qwen_status = "Kh?ng t?m th?y Qwen Service s?n s?ng.".to_string();
+            self.qwen_status = "No ready Qwen Service was found.".to_string();
             return;
         };
         let output_path = export_dir_for_session().join(format!(
@@ -2613,7 +3037,7 @@ impl TtsApp {
         self.qwen_rx = Some(rx);
 
         thread::spawn(move || {
-            let _ = tx.send(QwenEvent::Status("?ang g?i Qwen Service...".to_string()));
+            let _ = tx.send(QwenEvent::Status("Calling Qwen Service...".to_string()));
             let temp_dir = app_data_dir()
                 .join("tmp")
                 .join(format!("preview_{}", current_timestamp_ms()));
@@ -2632,7 +3056,7 @@ impl TtsApp {
                         character_name,
                         ref_text: (!result.ref_text.trim().is_empty()).then_some(result.ref_text),
                         samples: apply_volume_percent(&result.samples, volume_percent),
-                        message: format!("?? t?o preview: {}", output_path.display()),
+                        message: format!("Preview created: {}", output_path.display()),
                     });
                 }
                 Err(err) => {
@@ -2643,7 +3067,41 @@ impl TtsApp {
     }
 
     fn start_export_book_audio(&mut self) {
-        self.start_export_book_audio_internal(None);
+        let lines = parse_book_lines(&self.book_output);
+        if lines.is_empty() {
+            self.export_status = "No dialogue lines available to export.".to_string();
+            return;
+        }
+
+        let missing = self.missing_cached_book_lines();
+        if !missing.is_empty() {
+            let labels = missing
+                .iter()
+                .map(|(index, line)| format!("{} ({})", index + 1, line.speaker))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.export_status =
+                format!("Cannot export full audio yet. Missing speech cache for: {}", labels);
+            self.export_qwen_status = "Render the missing lines first.".to_string();
+            self.export_gemini_status = "Render the missing lines first.".to_string();
+            self.show_missing_audio_lines = true;
+            return;
+        }
+
+        match self.rebuild_audiobook_from_cache() {
+            Ok(()) => {
+                self.export_status = if self.last_audiobook_path.trim().is_empty() {
+                    "Audiobook merged from cache.".to_string()
+                } else {
+                    format!("Audiobook merged: {}", self.last_audiobook_path)
+                };
+                self.export_qwen_status = "Qwen idle.".to_string();
+                self.export_gemini_status = "Gemini idle.".to_string();
+            }
+            Err(err) => {
+                self.export_status = format!("Full audio export failed: {}", err);
+            }
+        }
     }
 
     fn start_export_skipped_lines(&mut self) {
@@ -2651,29 +3109,82 @@ impl TtsApp {
         indices.sort_unstable();
         indices.dedup();
         if indices.is_empty() {
-            self.export_status = "Kh?ng c? d?ng b? b? qua ?? xu?t l?i.".to_string();
+            self.export_status = "No skipped lines are available to render.".to_string();
             return;
         }
+        self.start_export_book_audio_internal(Some(indices));
+    }
+
+    fn start_render_missing_lines(&mut self) {
+        let mut indices = self.missing_renderable_book_line_indices();
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.is_empty() {
+            self.export_status = "No renderable unrendered lines found.".to_string();
+            return;
+        }
+        self.export_status = format!(
+            "Rendering {} unrendered lines...",
+            indices.len()
+        );
+        self.start_export_book_audio_internal(Some(indices));
+    }
+
+    fn start_render_all_lines(&mut self) {
+        let lines = parse_book_lines(&self.book_output);
+        if lines.is_empty() {
+            self.export_status = "No dialogue lines available to render.".to_string();
+            return;
+        }
+        let indices = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| self.effective_speaker_export_mode(&line.speaker) != SpeakerExportMode::Exclude)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if indices.is_empty() {
+            self.export_status = "No speakers are enabled for rendering.".to_string();
+            return;
+        }
+        self.export_status = format!("Rendering all {} lines...", indices.len());
         self.start_export_book_audio_internal(Some(indices));
     }
 
     fn start_export_book_audio_internal(&mut self, indices_filter: Option<Vec<usize>>) {
         let lines = parse_book_lines(&self.book_output);
         if lines.is_empty() {
-            self.export_status = "L?i: Ch?a c? d?ng tho?i h?p l? ?? xu?t audio.".to_string();
-            self.qwen_status = "Ch?a c? d?ng tho?i h?p l? ?? xu?t audio.".to_string();
+            self.export_status = "Error: no valid dialogue lines are available for audio export.".to_string();
+            self.qwen_status = "No valid dialogue lines are available for audio export.".to_string();
             return;
+        }
+        if indices_filter.is_none() {
+            let missing = self.missing_cached_book_lines();
+            if !missing.is_empty() {
+                let labels = missing
+                    .iter()
+                    .map(|(index, line)| format!("{} ({})", index + 1, line.speaker))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.export_status = format!(
+                    "Cannot export full audio yet. Missing speech cache for: {}",
+                    labels
+                );
+                self.export_qwen_status = "Render the missing lines first.".to_string();
+                self.export_gemini_status = "Render the missing lines first.".to_string();
+                self.show_missing_audio_lines = true;
+                return;
+            }
         }
         if let Some(indices) = &indices_filter {
             if indices.is_empty() {
-                self.export_status = "Kh?ng c? d?ng n?o ???c ch?n ?? xu?t.".to_string();
+                self.export_status = "No lines were selected for rendering.".to_string();
                 return;
             }
         }
 
-        self.export_status = "?ang ki?m tra nh?n v?t v? c?u h?nh voice...".to_string();
-        self.export_qwen_status = "Qwen ?ang ch?.".to_string();
-        self.export_gemini_status = "Gemini ?ang ch?.".to_string();
+        self.export_status = "Checking speaker mappings and voice configuration...".to_string();
+        self.export_qwen_status = "Qwen is idle.".to_string();
+        self.export_gemini_status = "Gemini is idle.".to_string();
         let lines_for_validation = if let Some(indices) = &indices_filter {
             lines.iter()
                 .enumerate()
@@ -2686,7 +3197,7 @@ impl TtsApp {
         let issues = self.collect_export_issues(&lines_for_validation);
         if !issues.is_empty() {
             self.export_status = format!(
-                "Kh?ng th? xu?t. Thi?u ho?c l?i c?u h?nh: {}",
+                "Cannot render. Missing or invalid configuration: {}",
                 issues.join(" | ")
             );
             self.qwen_status = format!(
@@ -2727,13 +3238,17 @@ impl TtsApp {
                     })
             })
             .count();
-        let retained_speeches = match self.collect_reusable_excluded_speeches(&lines_for_validation) {
-            Ok(items) => items,
-            Err(err) => {
-                self.export_status = format!("Kh?ng th? xu?t v?i danh s?ch lo?i tr?: {}", err);
-                self.qwen_status = self.export_status.clone();
-                return;
+        let retained_speeches = if indices_filter.is_none() {
+            match self.collect_reusable_excluded_speeches(&lines_for_validation) {
+                Ok(items) => items,
+                Err(err) => {
+                    self.export_status = format!("Kh?ng th? xu?t v?i danh s?ch lo?i tr?: {}", err);
+                    self.qwen_status = self.export_status.clone();
+                    return;
+                }
             }
+        } else {
+            Vec::new()
         };
         let output_dir = if self.last_export_dir.trim().is_empty() {
             match next_project_root_dir() {
@@ -3517,10 +4032,6 @@ impl TtsApp {
             }
         }
 
-        if let Err(err) = self.collect_reusable_excluded_speeches(lines) {
-            issues.push(err.to_string());
-        }
-
         issues
     }
 
@@ -4077,6 +4588,12 @@ impl TtsApp {
                     let _ = self.persist_state_to_disk();
                     clear_receiver = true;
                 }
+                VideoEvent::Cancelled(message) => {
+                    self.is_exporting_video = false;
+                    self.video_progress_label = "Cancelled".to_string();
+                    self.video_status = message;
+                    clear_receiver = true;
+                }
                 VideoEvent::Error(err) => {
                     self.is_exporting_video = false;
                     self.video_progress_label = "L?i".to_string();
@@ -4092,6 +4609,93 @@ impl TtsApp {
 
         if self.video_preview_started_at.is_some() && !self.is_playing {
             self.video_preview_started_at = None;
+        }
+    }
+
+    fn poll_srt_job_events(&mut self) {
+        loop {
+            match self.srt_job_rx.try_recv() {
+                Ok(event) => match event {
+                    SrtJobEvent::Status { job_id, message } => {
+                        if let Some(job) = self.srt_jobs.iter_mut().find(|job| job.id == job_id) {
+                            job.status = message.clone();
+                            job.progress_label = message.clone();
+                        }
+                        self.video_status = message;
+                    }
+                    SrtJobEvent::Progress {
+                        job_id,
+                        fraction,
+                        label,
+                    } => {
+                        if let Some(job) = self.srt_jobs.iter_mut().find(|job| job.id == job_id) {
+                            job.progress_fraction = fraction.clamp(0.0, 1.0);
+                            job.progress_label = label.clone();
+                            job.status = label.clone();
+                        }
+                    }
+                    SrtJobEvent::Ready {
+                        job_id,
+                        project_root,
+                        audio_path,
+                        path,
+                        timed_lines,
+                        word_segments,
+                    } => {
+                        if let Some(job) = self.srt_jobs.iter_mut().find(|job| job.id == job_id) {
+                            job.finished = true;
+                            job.failed = false;
+                            job.srt_path = path.to_string_lossy().to_string();
+                            job.progress_fraction = 1.0;
+                            job.progress_label = "SRT ready".to_string();
+                            job.status = format!("SRT ready: {}", path.display());
+                        }
+                        let current_project = if self.last_export_dir.trim().is_empty() {
+                            None
+                        } else {
+                            Some(normalize_project_root(Path::new(&self.last_export_dir)))
+                        };
+                        if current_project
+                            .as_ref()
+                            .is_some_and(|root| normalize_separators(root) == normalize_separators(Path::new(&project_root)))
+                        {
+                            self.video_timed_lines = timed_lines;
+                            self.video_word_segments = word_segments;
+                            self.video_srt_path = path.to_string_lossy().to_string();
+                            self.video_preview_audio_path = audio_path;
+                            self.video_preview_seek_seconds = 0.0;
+                            self.video_preview_started_at = None;
+                            self.video_preview_line_index = 0;
+                            self.video_status =
+                                format!("Background SRT ready: {}", path.display());
+                            let _ = self.persist_state_to_disk();
+                        }
+                        self.srt_job_cancel_flags.remove(&job_id);
+                    }
+                    SrtJobEvent::Error { job_id, error } => {
+                        if let Some(job) = self.srt_jobs.iter_mut().find(|job| job.id == job_id) {
+                            job.finished = true;
+                            job.failed = true;
+                            job.progress_label = "Failed".to_string();
+                            job.status = error.clone();
+                        }
+                        self.video_status = format!("Background SRT failed: {}", error);
+                        self.srt_job_cancel_flags.remove(&job_id);
+                    }
+                    SrtJobEvent::Cancelled { job_id, message } => {
+                        if let Some(job) = self.srt_jobs.iter_mut().find(|job| job.id == job_id) {
+                            job.finished = true;
+                            job.failed = true;
+                            job.progress_label = "Cancelled".to_string();
+                            job.status = message.clone();
+                        }
+                        self.video_status = message;
+                        self.srt_job_cancel_flags.remove(&job_id);
+                    }
+                },
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
         }
     }
 
@@ -4339,9 +4943,31 @@ impl TtsApp {
                     for (name, ref_text) in updates {
                         self.update_character_ref_text(&name, &ref_text);
                     }
+                    let previous_audiobook_path = self.last_audiobook_path.clone();
                     self.last_export_dir = output_dir.clone();
                     self.last_audiobook_path = audiobook_path.unwrap_or_default();
+                    self.video_preview_audio_path = self.last_audiobook_path.clone();
                     self.exported_speeches = speeches;
+                    let merged_audio_changed = !self.last_audiobook_path.trim().is_empty()
+                        && normalize_separators(Path::new(&previous_audiobook_path))
+                            != normalize_separators(Path::new(&self.last_audiobook_path));
+                    if merge_error.is_none() && merged_audio_changed {
+                        let root = normalize_project_root(Path::new(&self.last_export_dir));
+                        if let Err(err) = clear_directory_files(&project_subtitle_dir(&root)) {
+                            self.video_status = format!(
+                                "Audiobook merged, but could not clear subtitles: {}",
+                                err
+                            );
+                        } else {
+                            self.video_srt_path.clear();
+                            self.video_timed_lines.clear();
+                            self.video_word_segments.clear();
+                            self.last_video_export_path.clear();
+                            self.video_status =
+                                "Audiobook merged. Old subtitle files were cleared. Create SRT again."
+                                    .to_string();
+                        }
+                    }
                     self.persist_state_to_disk();
                     self.qwen_status = match merge_error {
                         Some(err) => format!(
@@ -4404,7 +5030,9 @@ impl eframe::App for TtsApp {
         self.poll_book_events();
         self.poll_character_events();
         self.poll_qwen_events();
+        self.poll_line_render_events();
         self.poll_video_events();
+        self.poll_srt_job_events();
         self.refresh_local_engines();
         let needs_repaint = self.is_fetching
             || self.is_playing
@@ -4412,6 +5040,8 @@ impl eframe::App for TtsApp {
             || self.is_formatting_book
             || self.is_analyzing_characters
             || self.is_qwen_busy
+            || self.active_qwen_line_renders > 0
+            || self.active_gemini_line_renders > 0
             || self.show_analysis_panel
             || self.is_exporting_video
             || self.show_video_window;
@@ -4423,6 +5053,7 @@ impl eframe::App for TtsApp {
         let mut line_preview_clicked: Option<usize> = None;
         let mut cached_preview_clicked: Option<usize> = None;
         let mut speaker_edits: Vec<(usize, String)> = Vec::new();
+        let mut text_edits: Vec<(usize, String)> = Vec::new();
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let book_lines = parse_book_lines(&self.book_output);
         if self
@@ -4544,6 +5175,77 @@ impl eframe::App for TtsApp {
                         "offline"
                     }
                 ));
+                if !self.srt_jobs.is_empty() {
+                    ui.add_space(6.0);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Background SRT jobs");
+                            if ui.button("Clear finished").clicked() {
+                                self.srt_jobs.retain(|job| !job.finished);
+                            }
+                        });
+                        let mut stop_srt_job_id = None;
+                        for job in &self.srt_jobs {
+                            ui.separator();
+                            let mut request_stop = false;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!(
+                                    "#{} | Project: {}",
+                                    job.id, job.project_root
+                                ));
+                                if !job.finished && ui.button("Stop SRT").clicked() {
+                                    request_stop = true;
+                                }
+                            });
+                            if request_stop {
+                                stop_srt_job_id = Some(job.id);
+                            }
+                            ui.label(format!("Audio: {}", job.audio_path));
+                            if !job.srt_path.trim().is_empty() {
+                                ui.label(format!("SRT: {}", job.srt_path));
+                            }
+                            ui.add(
+                                egui::ProgressBar::new(job.progress_fraction.clamp(0.0, 1.0))
+                                    .desired_width(ui.available_width())
+                                    .text(job.progress_label.clone()),
+                            );
+                            ui.label(format!("Status: {}", job.status));
+                        }
+                        if let Some(job_id) = stop_srt_job_id {
+                            self.stop_srt_job(job_id);
+                        }
+                    });
+                }
+                if self.is_exporting_video || !self.video_progress_label.trim().is_empty() {
+                    ui.add_space(6.0);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Background video job");
+                            if ui.button(if self.show_video_window {
+                                "Hide video export"
+                            } else {
+                                "Show video export"
+                            }).clicked() {
+                                self.show_video_window = !self.show_video_window;
+                            }
+                            if self.is_exporting_video && ui.button("Stop video job").clicked() {
+                                self.stop_video_job();
+                            }
+                        });
+                        ui.add(
+                            egui::ProgressBar::new(self.video_progress_fraction.clamp(0.0, 1.0))
+                                .desired_width(ui.available_width())
+                                .text(self.video_progress_label.clone()),
+                        );
+                        ui.label(format!("Status: {}", self.video_status));
+                        if !self.last_audiobook_path.trim().is_empty() {
+                            ui.label(format!(
+                                "Current project audiobook: {}",
+                                self.last_audiobook_path
+                            ));
+                        }
+                    });
+                }
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Save app data").clicked() {
@@ -4593,6 +5295,11 @@ impl eframe::App for TtsApp {
                 egui::CollapsingHeader::new("Book -> Dialogue")
                     .default_open(true)
                     .show(ui, |ui| {
+                        let missing_cached_lines = self.missing_cached_book_lines();
+                        let missing_renderable_lines = self.missing_renderable_book_lines();
+                        let can_export_full_audio =
+                            !book_lines.is_empty() && missing_cached_lines.is_empty();
+
                         ui.horizontal_wrapped(|ui| {
                             if ui
                                 .add_enabled(
@@ -4661,36 +5368,36 @@ impl eframe::App for TtsApp {
                         });
                         ui.horizontal_wrapped(|ui| {
                             if self.is_exporting_book
-                                && ui.button("Dá»«ng xuáº¥t audio").clicked()
+                                && ui.button("Stop audio export").clicked()
                             {
                                 self.stop_book_export();
                             }
                             ui.separator();
-                            if ui.button("XÃ³a speech cache").clicked() {
+                            if ui.button("Clear speech cache").clicked() {
                                 self.clear_speech_cache();
-                                self.export_status = "Đã xóa speech cache cũ.".to_string();
+                                self.export_status = "Speech cache cleared.".to_string();
                             }
                         });
-                        ui.label("Chế độ export");
+                        ui.label("Export mode");
                         ui.horizontal(|ui| {
                             ui.radio_value(
                                 &mut self.export_render_mode,
                                 ExportRenderMode::PerLine,
-                                "Theo tá»«ng dÃ²ng",
+                                "Per line",
                             );
                             ui.radio_value(
                                 &mut self.export_render_mode,
                                 ExportRenderMode::ByCharacter,
-                                "Gá»™p theo nhÃ¢n váº­t",
+                                "By character",
                             );
                         });
                         if self.export_render_mode == ExportRenderMode::ByCharacter {
-                            ui.label("Mode gá»™p theo nhÃ¢n váº­t lÃ  experimental: app sáº½ render cáº£ cá»¥m thoáº¡i cá»§a tá»«ng nhÃ¢n váº­t rá»“i tÃ¡ch láº¡i theo khoáº£ng láº·ng Ä‘á»ƒ giá»¯ giá»ng á»•n Ä‘á»‹nh hÆ¡n.");
+                            ui.label("Character grouping mode is experimental.");
                         }
                         if self.show_official_export_settings {
                             ui.group(|ui| {
-                                ui.label("Thiết lập xuất theo từng nhân vật");
-                                ui.checkbox(&mut self.auto_merge_after_render, "Tá»± ghÃ©p audio");
+                                ui.label("Per-speaker export settings");
+                                ui.checkbox(&mut self.auto_merge_after_render, "Auto-merge audio");
                                 let mut book_speakers = Vec::new();
                                 let mut seen = std::collections::BTreeSet::new();
                                 for line in &book_lines {
@@ -4704,34 +5411,35 @@ impl eframe::App for TtsApp {
                                     .iter()
                                     .map(|item| item.name.clone())
                                     .collect::<Vec<_>>();
+                                egui::Grid::new("speaker_export_settings_grid")
+                                    .num_columns(5)
+                                    .spacing([12.0, 6.0])
+                                    .striped(false)
+                                    .show(ui, |ui| {
                                 for speaker in book_speakers {
                                     let mut mode = self.effective_speaker_export_mode(&speaker);
                                     let mut voice_character = self
                                         .effective_voice_character_for_speaker(&speaker)
                                         .unwrap_or_default();
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(&speaker);
+                                        ui.add_sized([140.0, 22.0], egui::Label::new(&speaker));
                                         ui.radio_value(
                                             &mut mode,
                                             SpeakerExportMode::PerLine,
-                                            "Theo từng dòng",
+                                            "Per line",
                                         );
                                         ui.radio_value(
                                             &mut mode,
                                             SpeakerExportMode::Grouped,
-                                            "Gá»™p",
+                                            "Grouped",
                                         );
                                         ui.radio_value(
                                             &mut mode,
                                             SpeakerExportMode::Exclude,
-                                            "Loáº¡i trá»«",
+                                            "Exclude",
                                         );
-                                        egui::ComboBox::from_id_salt(format!(
-                                            "speaker_voice_map_{}",
-                                            speaker
-                                        ))
+                                        egui::ComboBox::from_id_salt(format!("speaker_voice_map_{}", speaker))
                                     .selected_text(if voice_character.is_empty() {
-                                            "Chọn voice..."
+                                            "Select voice..."
                                         } else {
                                             &voice_character
                                         })
@@ -4744,7 +5452,7 @@ impl eframe::App for TtsApp {
                                                 );
                                             }
                                         });
-                                    });
+                                        ui.end_row();
                                     if mode != self.effective_speaker_export_mode(&speaker) {
                                         self.set_speaker_export_mode(&speaker, mode);
                                         let _ = self.persist_state_to_disk();
@@ -4756,11 +5464,21 @@ impl eframe::App for TtsApp {
                                         let _ = self.persist_state_to_disk();
                                     }
                                 }
+                                    });
                                 ui.add_space(6.0);
                                 if ui
                                     .add_enabled(
                                         !self.is_qwen_busy && !book_lines.is_empty(),
-                                        egui::Button::new("Bắt đầu xuất"),
+                                        egui::Button::new("Render all lines"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_render_all_lines();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.is_qwen_busy && can_export_full_audio,
+                                        egui::Button::new("Start export"),
                                     )
                                     .clicked()
                                 {
@@ -4768,17 +5486,68 @@ impl eframe::App for TtsApp {
                                 }
                                 if ui
                                     .add_enabled(
+                                        !missing_renderable_lines.is_empty(),
+                                        egui::Button::new(if self.show_missing_audio_lines {
+                                            "Hide unrendered lines"
+                                        } else {
+                                            "Show unrendered lines"
+                                        }),
+                                    )
+                                    .clicked()
+                                {
+                                    self.show_missing_audio_lines =
+                                        !self.show_missing_audio_lines;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.is_qwen_busy && !missing_renderable_lines.is_empty(),
+                                        egui::Button::new("Render unrendered lines"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_render_missing_lines();
+                                }
+                                if ui
+                                    .add_enabled(
                                         !self.is_qwen_busy && !self.export_skipped_indices.is_empty(),
-                                        egui::Button::new("Xuất các dòng bị bỏ qua"),
+                                        egui::Button::new("Export skipped lines"),
                                     )
                                     .clicked()
                                 {
                                     self.start_export_skipped_lines();
                                 }
                             });
+                            if !can_export_full_audio {
+                                ui.add_space(4.0);
+                                ui.label(format!(
+                                    "Full audio export stays locked until every line has speech cache. Missing: {}",
+                                    missing_cached_lines.len()
+                                ));
+                            }
+                            if self.show_missing_audio_lines && !missing_renderable_lines.is_empty() {
+                                ui.add_space(6.0);
+                                ui.group(|ui| {
+                                    ui.label(format!(
+                                        "Unrendered lines: {}",
+                                        missing_renderable_lines.len()
+                                    ));
+                                    egui::ScrollArea::vertical()
+                                        .max_height(140.0)
+                                        .show(ui, |ui| {
+                                            for (index, line) in &missing_renderable_lines {
+                                                ui.label(format!(
+                                                    "{}. {}: {}",
+                                                    index + 1,
+                                                    line.speaker,
+                                                    excerpt_for_error(&line.text)
+                                                ));
+                                            }
+                                        });
+                                });
+                            }
                         }
-                        ui.label(format!("Trạng thái book: {}", self.book_status));
-                        ui.label(format!("Tráº¡ng thÃ¡i xuáº¥t: {}", self.export_status));
+                        ui.label(format!("Book status: {}", self.book_status));
+                        ui.label(format!("Export status: {}", self.export_status));
                         if self.export_progress_total > 0 {
                             let fraction = self.export_progress_done as f32
                                 / self.export_progress_total.max(1) as f32;
@@ -4795,18 +5564,18 @@ impl eframe::App for TtsApp {
                         if !self.export_skip_details.is_empty() {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(format!(
-                                    "Dòng bị bỏ qua: {}",
+                                    "Skipped lines: {}",
                                     self.export_skip_details.len()
                                 ));
-                                if ui.button("Copy lá»—i bá» qua").clicked() {
+                                if ui.button("Copy skipped errors").clicked() {
                                     ui.ctx().copy_text(self.export_skip_details.join("\n"));
                                     self.export_status =
-                                        "Đã copy danh sách dòng bị bỏ qua.".to_string();
+                                        "Skipped-line errors copied.".to_string();
                                 }
                                 if ui
                                     .add_enabled(
                                         !self.is_qwen_busy && !self.export_skipped_indices.is_empty(),
-                                        egui::Button::new("Xuất lại các dòng này"),
+                                        egui::Button::new("Render skipped lines"),
                                     )
                                     .clicked()
                                 {
@@ -4822,86 +5591,86 @@ impl eframe::App for TtsApp {
                                 });
                         }
                         if self.show_book_source {
-                            ui.label("Text book gốc");
+                            ui.label("Source text");
                             ui.add_sized(
                                 [ui.available_width(), 180.0],
                                 egui::TextEdit::multiline(&mut self.book_input)
                                     .desired_width(f32::INFINITY)
-                                    .hint_text("DÃ¡n Ä‘oáº¡n truyá»‡n hoáº·c book text vÃ o Ä‘Ã¢y..."),
+                                    .hint_text("Paste story text or book text here..."),
                             );
                         }
                         if self.show_book_result {
-                            ui.label("Kết quả narrator / nhân vật");
+                            ui.label("Narrator / character result");
                             ui.add_sized(
                                 [ui.available_width(), 220.0],
                                 egui::TextEdit::multiline(&mut self.book_output)
                                     .desired_width(f32::INFINITY)
-                                    .hint_text("Káº¿t quáº£ narrator: / nhÃ¢n váº­t: sáº½ hiá»‡n á»Ÿ Ä‘Ã¢y."),
+                                    .hint_text("Parsed narrator / character output will appear here."),
                             );
                         }
-                        ui.label(format!("Thư mục xuất audio book: {}", self.last_export_dir));
+                        ui.label(format!("Audiobook export folder: {}", self.last_export_dir));
                         if !self.last_audiobook_path.is_empty() {
-                            ui.label(format!("File audiobook Ä‘Ã£ ghÃ©p: {}", self.last_audiobook_path));
+                            ui.label(format!("Merged audiobook file: {}", self.last_audiobook_path));
                         }
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("Mở thư mục export").clicked() {
+                            if ui.button("Open export folder").clicked() {
                                 match open_path_in_explorer(Path::new(&self.last_export_dir)) {
                                     Ok(()) => {
-                                        self.qwen_status = "ÄÃ£ má»Ÿ thÆ° má»¥c export audio.".to_string()
+                                        self.qwen_status = "Opened audio export folder.".to_string()
                                     }
                                     Err(err) => {
                                         self.qwen_status =
-                                            format!("KhÃ´ng má»Ÿ Ä‘Æ°á»£c thÆ° má»¥c export: {}", err)
+                                            format!("Could not open export folder: {}", err)
                                     }
                                 }
                             }
                             if !self.last_audiobook_path.is_empty()
-                                && ui.button("Mở file audiobook").clicked()
+                                && ui.button("Open audiobook file").clicked()
                             {
                                 match open_in_browser(&self.last_audiobook_path) {
                                     Ok(()) => {
-                                        self.qwen_status = "ÄÃ£ má»Ÿ file audiobook.".to_string()
+                                        self.qwen_status = "Opened audiobook file.".to_string()
                                     }
                                     Err(err) => {
                                         self.qwen_status =
-                                            format!("KhÃ´ng má»Ÿ Ä‘Æ°á»£c audiobook: {}", err)
+                                            format!("Could not open audiobook: {}", err)
                                     }
                                 }
                             }
-                            if ui.button("GhÃ©p láº¡i audiobook").clicked() {
+                            if ui.button("Rebuild audiobook").clicked() {
                                 match self.rebuild_audiobook_from_cache() {
                                     Ok(()) => {
                                         self.export_status = format!(
-                                            "ÄÃ£ ghÃ©p láº¡i audiobook: {}",
+                                            "Rebuilt audiobook: {}",
                                             self.last_audiobook_path
                                         );
                                     }
                                     Err(err) => {
                                         self.export_status =
-                                            format!("ChÆ°a ghÃ©p láº¡i Ä‘Æ°á»£c audiobook: {}", err);
+                                            format!("Could not rebuild audiobook: {}", err);
                                     }
                                 }
                             }
-                            if self.can_export_video()
-                                && ui
-                                    .add_enabled(
-                                        !self.is_exporting_video,
-                                        egui::Button::new("Xuất video"),
-                                    )
-                                    .clicked()
+                            if ui
+                                .button(if self.show_video_window {
+                                    "Hide video export"
+                                } else {
+                                    "Export video"
+                                })
+                                .clicked()
                             {
-                                self.show_video_window = true;
+                                self.show_video_window = !self.show_video_window;
                             }
-                            ui.label("App chá»‰ giá»¯ láº¡i file audiobook Ä‘Ã£ ghÃ©p.");
+                            ui.label("The app keeps only the merged audiobook file.");
                         });
                         ui.add_space(8.0);
-                        ui.label("Dòng thoại đã tách");
+                            ui.label("Parsed dialogue lines");
                         egui::ScrollArea::vertical()
                             .id_salt("book_lines_scroll")
                             .max_height(280.0)
                             .show(ui, |ui| {
                                 if book_lines.is_empty() {
-                                    ui.label("ChÆ°a cÃ³ dÃ²ng thoáº¡i nÃ o Ä‘á»ƒ chá»n.");
+                                    ui.label("No dialogue lines available.");
                                 } else {
                                     for (index, line) in book_lines.iter().enumerate() {
                                         ui.group(|ui| {
@@ -4920,22 +5689,10 @@ impl eframe::App for TtsApp {
                                                 if response.changed() {
                                                     speaker_edits.push((index, speaker_name.clone()));
                                                 }
-                                                if ui
-                                                    .add_enabled(
-                                                        !self.is_qwen_busy,
-                                                        egui::Button::new("Preview"),
-                                                    )
-                                                    .clicked()
-                                                {
+                                                if ui.button("Preview").clicked() {
                                                     line_preview_clicked = Some(index);
                                                 }
-                                                if ui
-                                                    .add_enabled(
-                                                        !self.is_qwen_busy,
-                                                        egui::Button::new("Render dÃ²ng"),
-                                                    )
-                                                    .clicked()
-                                                {
+                                                if ui.button("Render line").clicked() {
                                                     self.start_render_book_line(index);
                                                 }
                                                 if self
@@ -4946,7 +5703,7 @@ impl eframe::App for TtsApp {
                                                 {
                                                     cached_preview_clicked = Some(index);
                                                 }
-                                                ui.label("Ã‚m lÆ°á»£ng dÃ²ng");
+                                                ui.label("Line volume");
                                                 if ui
                                                     .add(
                                                         egui::Slider::new(&mut line_gain, 40..=220)
@@ -4961,21 +5718,21 @@ impl eframe::App for TtsApp {
                                                         Ok(true) => {
                                                             let _ = self.rebuild_audiobook_from_cache();
                                                             self.export_status = format!(
-                                                                "ÄÃ£ Ã¡p ngay Ã¢m lÆ°á»£ng dÃ²ng {} = {}% vÃ o cache.",
+                                                                "Applied line volume {} = {}% to cache.",
                                                                 index + 1,
                                                                 line_gain
                                                             );
                                                         }
                                                         Ok(false) => {
                                                             self.export_status = format!(
-                                                                "ÄÃ£ Ä‘áº·t Ã¢m lÆ°á»£ng dÃ²ng {} = {}%. Khi render hoáº·c cÃ³ cache, app sáº½ Ã¡p dá»¥ng ngay.",
+                                                                "Set line volume {} = {}%. The app will apply it when cache exists or after render.",
                                                                 index + 1,
                                                                 line_gain
                                                             );
                                                         }
                                                         Err(err) => {
                                                             self.export_status = format!(
-                                                                "ÄÃ£ lÆ°u Ã¢m lÆ°á»£ng dÃ²ng {} nhÆ°ng chÆ°a Ã¡p Ä‘Æ°á»£c vÃ o cache: {}",
+                                                                "Saved line volume {} but could not apply it to cache yet: {}",
                                                                 index + 1,
                                                                 err
                                                             );
@@ -4983,10 +5740,16 @@ impl eframe::App for TtsApp {
                                                     }
                                                 }
                                             });
-                                            let line_label =
-                                                egui::Label::new(format!("{}: {}", speaker_name, line.text))
-                                                    .wrap();
-                                            if ui.add(line_label).clicked() {
+                                            let mut line_text = line.text.clone();
+                                            let text_response = ui.add(
+                                                egui::TextEdit::multiline(&mut line_text)
+                                                    .desired_width(ui.available_width())
+                                                    .desired_rows(3),
+                                            );
+                                            if text_response.changed() {
+                                                text_edits.push((index, line_text));
+                                            }
+                                            if text_response.clicked() {
                                                 self.selected_book_line = Some(index);
                                             }
                                         });
@@ -5037,7 +5800,7 @@ impl eframe::App for TtsApp {
                                         .auto_shrink([false, false])
                                         .show(ui, |ui| {
                                             if self.characters.is_empty() {
-                                                ui.label("ChÆ°a cÃ³ nhÃ¢n váº­t nÃ o Ä‘Æ°á»£c lÆ°u.");
+                                                ui.label("No saved character is mapped.");
                                             } else {
                                                 ui.label(format!("Total characters: {}", self.characters.len()));
                                                 ui.separator();
@@ -5152,7 +5915,7 @@ impl eframe::App for TtsApp {
                                             ) {
                                                 Ok(changed) if changed > 0 => {
                                                     self.character_status = format!(
-                                                        "ÄÃ£ Ä‘áº·t Ã¢m lÆ°á»£ng nhÃ¢n váº­t '{}' = {}% vÃ  Ã¡p ngay vÃ o {} dÃ²ng cache.",
+                                                        "Set character volume '{}' = {}% and applied it to {} cached lines.",
                                                         selected_name,
                                                         volume_percent,
                                                         changed
@@ -5160,14 +5923,14 @@ impl eframe::App for TtsApp {
                                                 }
                                                 Ok(_) => {
                                                     self.character_status = format!(
-                                                        "ÄÃ£ Ä‘áº·t Ã¢m lÆ°á»£ng nhÃ¢n váº­t '{}' = {}%. CÃ¡c láº§n render sau sáº½ dÃ¹ng má»©c nÃ y.",
+                                                        "Set character volume '{}' = {}%. Future renders will use this value.",
                                                         selected_name,
                                                         volume_percent
                                                     );
                                                 }
                                                 Err(err) => {
                                                     self.character_status = format!(
-                                                        "ÄÃ£ lÆ°u Ã¢m lÆ°á»£ng nhÃ¢n váº­t '{}' nhÆ°ng chÆ°a Ã¡p Ä‘Æ°á»£c vÃ o cache: {}",
+                                                        "Saved character volume '{}' but could not apply it to cache yet: {}",
                                                         selected_name,
                                                         err
                                                     );
@@ -5257,7 +6020,7 @@ impl eframe::App for TtsApp {
                                 .suffix(" ms"),
                         );
                         ui.add_space(6.0);
-                        ui.label("Ngôn ngữ Qwen");
+                        ui.label("Ng�n ng? Qwen");
                         egui::ComboBox::from_id_salt("qwen_language")
                             .selected_text(&self.qwen_language)
                             .show_ui(ui, |ui| {
@@ -5269,7 +6032,7 @@ impl eframe::App for TtsApp {
                                     );
                                 }
                             });
-                        ui.label("Chế độ clone");
+                        ui.label("Ch? d? clone");
                         ui.horizontal(|ui| {
                             ui.radio_value(
                                 &mut self.qwen_xvector_only,
@@ -5282,11 +6045,11 @@ impl eframe::App for TtsApp {
                                 "Use x-vector only",
                             );
                         });
-                        ui.label(format!("Trạng thái Qwen: {}", self.qwen_status));
+                        ui.label(format!("Qwen status: {}", self.qwen_status));
                         if let Some(index) = self.selected_character {
                             if let Some(character) = self.characters.get(index) {
                                 ui.separator();
-                                ui.label(format!("NhÃ¢n váº­t Ä‘ang chá»n: {}", character.name));
+                                ui.label(format!("Selected character: {}", character.name));
                                 ui.label(format!(
                                     "Engine: {}",
                                     if character.tts_engine == "gemini" {
@@ -5302,11 +6065,11 @@ impl eframe::App for TtsApp {
                                     ui.label(format!("Ref audio: {}", character.ref_audio_path));
                                 }
                                 if !character.ref_text.is_empty() {
-                                    ui.label("Ref text Ä‘Ã£ cÃ³ sáºµn trong thÆ° viá»‡n.");
+                                    ui.label("Ref text already exists in the library.");
                                 }
                             }
                         } else {
-                            ui.label("Chá»n má»™t nhÃ¢n váº­t trong thÆ° viá»‡n Ä‘á»ƒ dÃ¹ng láº¡i ref audio vÃ  ref text.");
+                            ui.label("Select a character from the library to reuse ref audio and ref text.");
                         }
                     });
 
@@ -5326,7 +6089,7 @@ impl eframe::App for TtsApp {
                         }
 
                         ui.add_space(6.0);
-                        ui.label("Giọng đọc đang chọn");
+                        ui.label("Selected voice");
                         ui.add_sized(
                             [ui.available_width(), 28.0],
                             egui::TextEdit::singleline(&mut self.voice_name)
@@ -5334,25 +6097,25 @@ impl eframe::App for TtsApp {
                         );
 
                         ui.add_space(6.0);
-                        ui.label("Tốc độ đọc");
+                        ui.label("T?c d? d?c");
                         ui.horizontal(|ui| {
-                            ui.radio_value(&mut self.speed, SpeechSpeed::Slow, "Cháº­m");
-                            ui.radio_value(&mut self.speed, SpeechSpeed::Normal, "BÃ¬nh thÆ°á»ng");
+                            ui.radio_value(&mut self.speed, SpeechSpeed::Slow, "Slow");
+                            ui.radio_value(&mut self.speed, SpeechSpeed::Normal, "Normal");
                             ui.radio_value(&mut self.speed, SpeechSpeed::Fast, "Nhanh");
                         });
-                        ui.label(format!("Äang chá»n: {}", self.speed.as_str()));
+                        ui.label(format!("Selected: {}", self.speed.as_str()));
 
                         ui.add_space(6.0);
-                        ui.label("Prompt giọng điệu / cách đọc");
+                        ui.label("Prompt gi?ng di?u / c�ch d?c");
                         ui.add_sized(
                             [ui.available_width(), 110.0],
                             egui::TextEdit::multiline(&mut self.style_instruction)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("VÃ­ dá»¥: Äá»c tá»± nhiÃªn, rÃµ chá»¯, cÃ³ nhá»‹p ká»ƒ chuyá»‡n."),
+                                .hint_text("Example: Read naturally, clearly, with a storytelling rhythm."),
                         );
 
                         ui.add_space(6.0);
-                        ui.label("Nội dung preview voice");
+                        ui.label("N?i dung preview voice");
                         ui.add_sized(
                             [ui.available_width(), 70.0],
                             egui::TextEdit::multiline(&mut self.preview_text)
@@ -5361,12 +6124,12 @@ impl eframe::App for TtsApp {
                         );
 
                         ui.add_space(6.0);
-                        ui.label("Văn bản chính để đọc");
+                        ui.label("Van b?n ch�nh d? d?c");
                         ui.add_sized(
                             [ui.available_width(), 180.0],
                             egui::TextEdit::multiline(&mut self.text)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("Nháº­p Ä‘oáº¡n vÄƒn báº£n tiáº¿ng Viá»‡t táº¡i Ä‘Ã¢y..."),
+                                .hint_text("Enter the main text to read here..."),
                         );
 
                         ui.add_space(10.0);
@@ -5375,29 +6138,29 @@ impl eframe::App for TtsApp {
                                 .add_enabled(
                                     !self.is_fetching,
                                     egui::Button::new(if self.is_fetching {
-                                        "Äang xá»­ lÃ½..."
+                                        "Processing..."
                                     } else {
-                                        "Đọc văn bản"
+                                        "Speak text"
                                     }),
                                 )
                                 .clicked()
                             {
                                 self.start_speak_main();
                             }
-                            if ui.button("Dá»«ng").clicked() {
+                            if ui.button("Stop").clicked() {
                                 self.stop_audio();
-                                self.status = "ÄÃ£ dá»«ng.".to_string();
+                                self.status = "Stopped.".to_string();
                             }
-                            if ui.button("Xuáº¥t audio (WAV)").clicked() {
+                            if ui.button("Export audio (WAV)").clicked() {
                                 self.export_last_audio();
                             }
-                            if ui.button("Mở phân tích voice sample").clicked() {
+                            if ui.button("Open voice sample analysis").clicked() {
                                 self.show_analysis_panel = true;
                             }
                         });
 
-                        ui.label(format!("Thư mục xuất mặc định: {}", EXPORT_DIR));
-                        ui.label(format!("Tráº¡ng thÃ¡i TTS: {}", self.status));
+                        ui.label(format!("Default export folder: {}", EXPORT_DIR));
+                        ui.label(format!("TTS status: {}", self.status));
 
                         ui.add_space(10.0);
                         ui.separator();
@@ -5421,7 +6184,7 @@ impl eframe::App for TtsApp {
                                     }
                                 });
 
-                            cols[1].label("Ná»¯");
+                            cols[1].label("Female");
                             egui::ScrollArea::vertical()
                                 .id_salt("female_voices_scroll")
                                 .max_height(180.0)
@@ -5451,13 +6214,13 @@ impl eframe::App for TtsApp {
             };
             let mut analysis_window_open = self.show_analysis_panel;
 
-            egui::Window::new("Phân tích Voice Sample")
+            egui::Window::new("Voice Sample Analysis")
                 .open(&mut analysis_window_open)
                 .default_size([720.0, 620.0])
                 .vscroll(true)
                 .show(ctx, |ui| {
                     ui.label(
-                        "Kéo thả một đoạn voice ngắn của một người vào đây. Gemini sẽ phân tích nhịp đọc, độ dày giọng, độ sáng/tối, ngắt nghỉ và gợi ý prompt để bạn paste vào TTS.",
+                        "K�o th? m?t do?n voice ng?n c?a m?t ngu?i v�o d�y. Gemini s? ph�n t�ch nh?p d?c, d? d�y gi?ng, d? s�ng/t?i, ng?t ngh? v� g?i � prompt d? b?n paste v�o TTS.",
                     );
 
                     egui::Frame::group(ui.style())
@@ -5465,9 +6228,9 @@ impl eframe::App for TtsApp {
                         .show(ui, |ui| {
                             ui.set_min_height(90.0);
                             ui.vertical_centered(|ui| {
-                                ui.label("Kéo và thả file audio vào đây");
-                                ui.label("Há»— trá»£: mp3, wav, m4a, flac, ogg, webm, aac");
-                                ui.label("NÃªn dÃ¹ng clip ngáº¯n 5-20 giÃ¢y, má»™t ngÆ°á»i nÃ³i rÃµ rÃ ng.");
+                                ui.label("K�o v� th? file audio v�o d�y");
+                                ui.label("Supported: mp3, wav, m4a, flac, ogg, webm, aac");
+                                ui.label("Use a short 5-20 second clip with one clear speaker.");
                                 if let Some(path) = &self.dropped_audio_path {
                                     ui.monospace(path.to_string_lossy());
                                 }
@@ -5480,9 +6243,9 @@ impl eframe::App for TtsApp {
                             .add_enabled(
                                 !self.is_analyzing && self.dropped_audio_path.is_some(),
                                 egui::Button::new(if self.is_analyzing {
-                                    "Đang phân tích..."
+                                    "Analyzing..."
                                 } else {
-                                    "PhÃ¢n tÃ­ch voice"
+                                    "Analyze voice"
                                 }),
                             )
                             .clicked()
@@ -5490,50 +6253,50 @@ impl eframe::App for TtsApp {
                             self.start_voice_analysis();
                         }
 
-                            if ui.button("Dùng prompt này cho TTS").clicked() {
+                            if ui.button("D�ng prompt n�y cho TTS").clicked() {
                             if !self.analysis_result.tts_prompt.trim().is_empty() {
                                 self.style_instruction = self.analysis_result.tts_prompt.clone();
                                 self.status =
-                                    "ÄÃ£ náº¡p prompt phÃ¢n tÃ­ch vÃ o Ã´ Prompt giá»ng Ä‘iá»‡u / cÃ¡ch Ä‘á»c."
+                                    "Loaded the analysis prompt into the voice style prompt field."
                                         .to_string();
                             }
                         }
 
                         if ui.button("Copy prompt").clicked() {
                             ui.ctx().copy_text(self.analysis_result.tts_prompt.clone());
-                            self.analysis_status = "ÄÃ£ copy prompt vÃ o clipboard.".to_string();
+                            self.analysis_status = "Copied prompt to clipboard.".to_string();
                         }
                     });
 
-                    ui.label(format!("Tráº¡ng thÃ¡i phÃ¢n tÃ­ch: {}", self.analysis_status));
+                    ui.label(format!("Analysis status: {}", self.analysis_status));
 
                     ui.add_space(6.0);
-                    ui.label("Transcript từ audio");
+                    ui.label("Transcript t? audio");
                     ui.add_sized(
                         [ui.available_width(), 100.0],
                         egui::TextEdit::multiline(&mut self.analysis_result.transcript)
                             .desired_width(f32::INFINITY)
                             .interactive(false)
-                            .hint_text("Gemini sáº½ tráº£ transcript á»Ÿ Ä‘Ã¢y."),
+                            .hint_text("Gemini transcript will appear here."),
                     );
 
                     ui.add_space(6.0);
-                    ui.label("Tóm tắt cấu trúc giọng");
+                    ui.label("T�m t?t c?u tr�c gi?ng");
                     ui.add_sized(
                         [ui.available_width(), 140.0],
                         egui::TextEdit::multiline(&mut self.analysis_result.style_summary)
                             .desired_width(f32::INFINITY)
                             .interactive(false)
-                            .hint_text("TÃ³m táº¯t nhá»‹p Ä‘iá»‡u, Ä‘á»™ dÃ y, hÆ¡i giáº£, ngáº¯t nghá»‰..."),
+                            .hint_text("Summary of rhythm, weight, breathiness, and pauses..."),
                     );
 
                     ui.add_space(6.0);
-                    ui.label("Prompt để paste vào TTS");
+                    ui.label("Prompt d? paste v�o TTS");
                     ui.add_sized(
                         [ui.available_width(), 140.0],
                         egui::TextEdit::multiline(&mut self.analysis_result.tts_prompt)
                             .desired_width(f32::INFINITY)
-                            .hint_text("Prompt Ä‘á»ƒ copy vÃ o pháº§n Prompt giá»ng Ä‘iá»‡u / cÃ¡ch Ä‘á»c."),
+                            .hint_text("Prompt to copy into the voice style / reading prompt field."),
                     );
                 });
             self.show_analysis_panel = analysis_window_open;
@@ -5556,19 +6319,47 @@ impl eframe::App for TtsApp {
                     }
                 }
             }
-            let mut video_window_open = self.show_video_window;
             let preview_lines_all = parse_book_lines(&self.book_output);
             if !preview_lines_all.is_empty() && self.video_preview_line_index >= preview_lines_all.len() {
                 self.video_preview_line_index = preview_lines_all.len() - 1;
             }
-            egui::Window::new("Video Export")
-                .open(&mut video_window_open)
-                .default_size([980.0, 760.0])
-                .vscroll(true)
+            egui::SidePanel::right("video_export_panel")
+                .resizable(true)
+                .default_width(560.0)
+                .min_width(420.0)
                 .show(ctx, |ui| {
+                    ui.heading("Video Export");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Hide video export").clicked() {
+                            self.show_video_window = false;
+                        }
+                    });
+                    ui.add_space(6.0);
                     ui.label(format!("Video status: {}", self.video_status));
+                    let current_project_audio = if !self.last_audiobook_path.trim().is_empty() {
+                        self.last_audiobook_path.trim().to_string()
+                    } else {
+                        "(none)".to_string()
+                    };
+                    ui.label(format!("Current project audiobook: {}", current_project_audio));
+                    let current_project_root = if self.last_export_dir.trim().is_empty() {
+                        None
+                    } else {
+                        Some(normalize_project_root(Path::new(&self.last_export_dir)))
+                    };
+                    if let Some(root) = current_project_root {
+                        let gemini_audio = project_subtitle_dir(&root).join("audiobook_for_gemini.mp3");
+                        ui.label(format!(
+                            "Current SRT source audio: {}",
+                            if gemini_audio.exists() {
+                                gemini_audio.display().to_string()
+                            } else {
+                                "(not created yet)".to_string()
+                            }
+                        ));
+                    }
                     if !self.video_srt_path.trim().is_empty() {
-                        ui.label(format!("SRT hiá»‡n táº¡i: {}", self.video_srt_path));
+                        ui.label(format!("Current SRT: {}", self.video_srt_path));
                     }
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.label("Drop an SRT file here, or paste a path. The app will auto-load it if it exists.");
@@ -5585,12 +6376,12 @@ impl eframe::App for TtsApp {
                                 }
                                 let _ = self.persist_state_to_disk();
                             }
-                            if ui.button("Náº¡p SRT").clicked() {
+                            if ui.button("Load SRT").clicked() {
                                 let path = PathBuf::from(self.video_srt_path.trim());
                                 match self.load_video_srt_from_path(&path) {
                                     Ok(()) => {}
                                     Err(err) => {
-                                        self.video_status = format!("KhÃ´ng náº¡p Ä‘Æ°á»£c SRT: {}", err);
+                                        self.video_status = format!("Could not load SRT: {}", err);
                                     }
                                 }
                             }
@@ -5601,7 +6392,7 @@ impl eframe::App for TtsApp {
                         let bg_response = ui.add_sized(
                             [ui.available_width() - 120.0, 28.0],
                             egui::TextEdit::singleline(&mut self.video_background_path)
-                                .hint_text("KÃ©o tháº£ áº£nh ná»n vÃ o app hoáº·c dÃ¡n Ä‘Æ°á»ng dáº«n táº¡i Ä‘Ã¢y"),
+                                .hint_text("Drop a background image here or paste a path."),
                         );
                         if bg_response.changed() {
                             self.video_preview_texture = None;
@@ -5609,6 +6400,64 @@ impl eframe::App for TtsApp {
                             let _ = self.persist_state_to_disk();
                         }
                     });
+                    let old_tag_position = self.video_tag_position;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Video tag");
+                        let tag_response = ui.add_sized(
+                            [280.0, 28.0],
+                            egui::TextEdit::singleline(&mut self.video_corner_tag)
+                                .hint_text("Prologue / Chapter 1 / Epilogue"),
+                        );
+                        if tag_response.changed() {
+                            let _ = self.persist_state_to_disk();
+                        }
+                        ui.label("Tag font");
+                        if ui
+                            .add(egui::Slider::new(&mut self.video_tag_font_size, 36..=120))
+                            .changed()
+                        {
+                            let _ = self.persist_state_to_disk();
+                        }
+                        if ui
+                            .checkbox(&mut self.video_tag_background_enabled, "Tag background")
+                            .changed()
+                        {
+                            let _ = self.persist_state_to_disk();
+                        }
+                        ui.radio_value(
+                            &mut self.video_tag_position,
+                            VideoTagPosition::TopLeft,
+                            "Top-left",
+                        );
+                        ui.radio_value(
+                            &mut self.video_tag_position,
+                            VideoTagPosition::TopCenter,
+                            "Top-center",
+                        );
+                        ui.label("Subtitle lead");
+                        if ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut self.video_subtitle_lead_seconds,
+                                    0.0..=1.5,
+                                )
+                                .step_by(0.05),
+                            )
+                            .changed()
+                        {
+                            let current_srt = self.video_srt_path.trim().to_string();
+                            let _ = self.persist_state_to_disk();
+                            if !current_srt.is_empty() {
+                                let path = PathBuf::from(current_srt);
+                                if path.exists() {
+                                    let _ = self.load_video_srt_from_path(&path);
+                                }
+                            }
+                        }
+                    });
+                    if self.video_tag_position != old_tag_position {
+                        let _ = self.persist_state_to_disk();
+                    }
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Font");
                         let mut font_changed = false;
@@ -5812,6 +6661,47 @@ impl eframe::App for TtsApp {
                         18.0,
                         egui::Color32::from_rgba_unmultiplied(10, 10, 10, self.video_card_opacity),
                     );
+                    if !self.video_corner_tag.trim().is_empty() {
+                        let tag_size =
+                            estimate_tag_square_size(self.video_corner_tag.trim(), self.video_tag_font_size)
+                                as f32;
+                        let tag_min = match self.video_tag_position {
+                            VideoTagPosition::TopLeft => {
+                                egui::pos2(preview_rect.left(), preview_rect.top())
+                            }
+                            VideoTagPosition::TopCenter => egui::pos2(
+                                preview_rect.center().x - tag_size / 2.0,
+                                preview_rect.top(),
+                            ),
+                        };
+                        let tag_rect = egui::Rect::from_min_max(
+                            tag_min,
+                            egui::pos2(tag_min.x + tag_size, tag_min.y + tag_size),
+                        );
+                        if self.video_tag_background_enabled {
+                            painter.rect_filled(
+                                tag_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(
+                                    10,
+                                    10,
+                                    10,
+                                    self.video_card_opacity,
+                                ),
+                            );
+                        }
+                        let tag_font = egui::FontId::new(
+                            self.video_tag_font_size as f32,
+                            video_preview_font_family(&self.video_font_name),
+                        );
+                        painter.text(
+                            egui::pos2(tag_rect.left() + 14.0, tag_rect.top() + 14.0),
+                            egui::Align2::LEFT_TOP,
+                            self.video_corner_tag.trim(),
+                            tag_font,
+                            current_color,
+                        );
+                    }
                     let active_index = self.current_video_preview_line_index();
                     let elapsed_seconds = self.current_video_preview_seconds();
                     let active_progress =
@@ -5991,7 +6881,7 @@ impl eframe::App for TtsApp {
                             text_painter.galley(pos, galley, color);
                         }
                     } else {
-                        let fallback = "ChÆ°a cÃ³ subtitle Ä‘á»ƒ preview.".to_string();
+                        let fallback = "No subtitles available for preview.".to_string();
                         let galley = text_painter.layout(
                             fallback,
                             font_id_current.clone(),
@@ -6030,13 +6920,18 @@ impl eframe::App for TtsApp {
                         );
                     }
                     ui.horizontal_wrapped(|ui| {
+                        if self.is_exporting_video
+                            && ui.button("Stop video job").clicked()
+                        {
+                            self.stop_video_job();
+                        }
                         if ui
                             .add_enabled(
                                 !self.is_exporting_video && self.can_export_video(),
                                 egui::Button::new(if self.is_exporting_video {
                                         "Creating SRT..."
                                 } else {
-                                        "Táº¡o SRT"
+                                        "Create SRT"
                                 }),
                             )
                             .clicked()
@@ -6047,9 +6942,9 @@ impl eframe::App for TtsApp {
                             && ui.button("Open SRT").clicked()
                         {
                             match open_in_browser(&self.video_srt_path) {
-                                Ok(()) => self.video_status = "ÄÃ£ má»Ÿ file SRT.".to_string(),
+                                Ok(()) => self.video_status = "Opened SRT file.".to_string(),
                                 Err(err) => {
-                                    self.video_status = format!("KhÃ´ng má»Ÿ Ä‘Æ°á»£c SRT: {}", err)
+                                    self.video_status = format!("Could not open SRT: {}", err)
                                 }
                             }
                         }
@@ -6068,14 +6963,14 @@ impl eframe::App for TtsApp {
                         {
                             self.stop_audio();
                             self.video_preview_started_at = None;
-                            self.video_status = "ÄÃ£ dá»«ng preview video.".to_string();
+                            self.video_status = "Stopped video preview.".to_string();
                         }
                         if self.can_export_video() {
                             if ui
                                 .add_enabled(
                                     !self.is_exporting_video && !self.video_timed_lines.is_empty(),
                                     egui::Button::new(if self.is_exporting_video {
-                                        "Äang xuáº¥t preview..."
+                                        "Exporting preview..."
                                     } else {
                                         "Export preview clip"
                                     }),
@@ -6091,7 +6986,7 @@ impl eframe::App for TtsApp {
                                 .add_enabled(
                                     !self.is_exporting_video && !self.video_timed_lines.is_empty(),
                                     egui::Button::new(if self.is_exporting_video {
-                                        "Äang xuáº¥t video..."
+                                        "Exporting video..."
                                     } else {
                                         "Start video export"
                                     }),
@@ -6102,57 +6997,65 @@ impl eframe::App for TtsApp {
                                 self.start_video_export();
                             }
                         } else {
-                            ui.label("Video export is available only when every line already has speech cache.");
+                            ui.label(format!(
+                                "Video export is locked until every parsed line has speech cache. Missing: {}",
+                                self.missing_cached_book_line_indices().len()
+                            ));
                         }
                         if !self.last_export_dir.trim().is_empty()
-                            && ui.button("Má»Ÿ thÆ° má»¥c export").clicked()
+                            && ui.button("Open export folder").clicked()
                         {
                             match open_path_in_explorer(Path::new(&self.last_export_dir)) {
-                                Ok(()) => self.video_status = "ÄÃ£ má»Ÿ thÆ° má»¥c export video.".to_string(),
+                                Ok(()) => self.video_status = "Opened video export folder.".to_string(),
                                 Err(err) => {
                                     self.video_status =
-                                        format!("KhÃ´ng má»Ÿ Ä‘Æ°á»£c thÆ° má»¥c export video: {}", err)
+                                        format!("Could not open video export folder: {}", err)
                                 }
                             }
                         }
                         if !self.last_export_dir.trim().is_empty()
-                            && ui.button("Má»Ÿ preview").clicked()
+                            && ui.button("Open preview").clicked()
                         {
                             let preview_dir = project_video_preview_dir(Path::new(&self.last_export_dir));
                             match open_path_in_explorer(&preview_dir) {
-                                Ok(()) => self.video_status = "ÄÃ£ má»Ÿ thÆ° má»¥c preview.".to_string(),
+                                Ok(()) => self.video_status = "Opened preview folder.".to_string(),
                                 Err(err) => {
                                     self.video_status =
-                                        format!("KhÃ´ng má»Ÿ Ä‘Æ°á»£c thÆ° má»¥c preview: {}", err)
+                                        format!("Could not open preview folder: {}", err)
                                 }
                             }
                         }
                         if !self.last_export_dir.trim().is_empty()
-                            && ui.button("Má»Ÿ thÆ° má»¥c video").clicked()
+                            && ui.button("Open video folder").clicked()
                         {
                             let final_dir = project_video_final_dir(Path::new(&self.last_export_dir));
                             match open_path_in_explorer(&final_dir) {
-                                Ok(()) => self.video_status = "ÄÃ£ má»Ÿ thÆ° má»¥c video.".to_string(),
+                                Ok(()) => self.video_status = "Opened video folder.".to_string(),
                                 Err(err) => {
                                     self.video_status =
-                                        format!("KhÃ´ng má»Ÿ Ä‘Æ°á»£c thÆ° má»¥c video: {}", err)
+                                        format!("Could not open video folder: {}", err)
                                 }
                             }
                         }
                         if !self.last_video_export_path.trim().is_empty()
-                            && ui.button("Má»Ÿ video").clicked()
+                            && ui.button("Open video").clicked()
                         {
                             match open_in_browser(&self.last_video_export_path) {
-                                Ok(()) => self.video_status = "ÄÃ£ má»Ÿ file video.".to_string(),
+                                Ok(()) => self.video_status = "Opened video file.".to_string(),
                                 Err(err) => {
                                     self.video_status =
-                                        format!("KhÃ´ng má»Ÿ Ä‘Æ°á»£c file video: {}", err)
+                                        format!("Could not open video file: {}", err)
                                 }
                             }
                         }
                     });
                 });
-            self.show_video_window = video_window_open;
+        }
+
+        text_edits.sort_by_key(|(index, _)| *index);
+        text_edits.dedup_by(|a, b| a.0 == b.0);
+        for (index, text) in text_edits {
+            self.set_book_line_text(index, &text);
         }
 
         speaker_edits.sort_by_key(|(index, _)| *index);
@@ -6393,7 +7296,7 @@ fn normalize_gemini_tts_text(input: &str) -> String {
 }
 
 fn prepare_gemini_live_text(input: &str) -> String {
-    normalize_gemini_tts_text(input).to_lowercase()
+    ensure_sentence_like_text(&normalize_gemini_tts_text(input)).to_lowercase()
 }
 
 fn excerpt_for_error(text: &str) -> String {
@@ -7872,6 +8775,23 @@ fn project_audio_dir(root: &Path) -> PathBuf {
     root.join("audio")
 }
 
+fn clear_directory_files(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("Could not read {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file() {
+            fs::remove_file(&path)
+                .with_context(|| format!("Could not remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn project_audio_lines_dir(root: &Path) -> PathBuf {
     root.join("audio").join("lines")
 }
@@ -8520,7 +9440,7 @@ fn analyze_sentence_timing_with_gemini(
 
     if parsed.segments.len() != sentence_items.len() {
         return Err(anyhow!(
-            "Gemini tra {} segment, trong khi can {} cau.",
+            "Sentence timing mismatch: Gemini returned {} segments for {} sentences. One sentence was likely merged, skipped, or split differently.",
             parsed.segments.len(),
             sentence_items.len()
         ));
@@ -8615,6 +9535,13 @@ fn apply_subtitle_lead_to_word_segments(segments: &mut [TimedWordSegment], lead_
     }
 }
 
+fn ensure_not_cancelled(cancel_flag: &AtomicBool, message: &str) -> Result<()> {
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err(anyhow!(message.to_string()));
+    }
+    Ok(())
+}
+
 fn build_video_srt_with_gemini(
     api_key: &str,
     lines: &[BookLine],
@@ -8623,15 +9550,19 @@ fn build_video_srt_with_gemini(
     output_dir: &Path,
     pause_ms: u32,
     enable_word_highlight: bool,
+    subtitle_lead_seconds: f64,
+    cancel_flag: &AtomicBool,
     progress_tx: Sender<VideoEvent>,
 ) -> Result<(PathBuf, Vec<TimedBookLine>, Vec<TimedWordSegment>)> {
     ensure_project_structure(output_dir)?;
+    ensure_not_cancelled(cancel_flag, "Video export cancelled.")?;
     let _ = progress_tx.send(VideoEvent::Progress {
         fraction: 0.05,
         label: "?ang chu?n b? audio cho Gemini...".to_string(),
     });
     let compressed_audio_path = project_subtitle_dir(output_dir).join("audiobook_for_gemini.mp3");
     compress_audio_for_gemini(audiobook_path, &compressed_audio_path)?;
+    ensure_not_cancelled(cancel_flag, "SRT generation cancelled.")?;
     let sentence_items = collect_sentence_items(lines, speeches, pause_ms)?;
     if sentence_items.is_empty() {
         return Err(anyhow!("Kh?ng tao duoc ??nh sach cau cho video."));
@@ -8645,14 +9576,18 @@ fn build_video_srt_with_gemini(
         &compressed_audio_path,
         &sentence_items,
     )?;
-    apply_subtitle_lead_to_lines(&mut timed_lines, VIDEO_SUBTITLE_LEAD_SECONDS);
+    ensure_not_cancelled(cancel_flag, "Video export cancelled.")?;
+    apply_subtitle_lead_to_lines(&mut timed_lines, subtitle_lead_seconds);
     let mut word_segments = if enable_word_highlight {
         let _ = progress_tx.send(VideoEvent::Progress {
             fraction: 0.23,
             label: "?ang d?ng Gemini t?o word timing...".to_string(),
         });
         let word_items = collect_word_items(&timed_lines);
-        analyze_word_timing_with_gemini(api_key, &compressed_audio_path, &word_items)?
+        let segments =
+            analyze_word_timing_with_gemini(api_key, &compressed_audio_path, &word_items)?;
+        ensure_not_cancelled(cancel_flag, "Video export cancelled.")?;
+        segments
     } else {
         let _ = progress_tx.send(VideoEvent::Progress {
             fraction: 0.23,
@@ -8660,7 +9595,7 @@ fn build_video_srt_with_gemini(
         });
         Vec::new()
     };
-    apply_subtitle_lead_to_word_segments(&mut word_segments, VIDEO_SUBTITLE_LEAD_SECONDS);
+    apply_subtitle_lead_to_word_segments(&mut word_segments, subtitle_lead_seconds);
     let srt_path = next_numbered_file_path(&project_subtitle_dir(output_dir), "subtitles", "srt")?;
     fs::write(&srt_path, build_srt_content(&timed_lines))
         .with_context(|| format!("Kh?ng ghi duoc {}", srt_path.display()))?;
@@ -8678,6 +9613,84 @@ fn build_video_srt_with_gemini(
     let _ = progress_tx.send(VideoEvent::Progress {
         fraction: 0.28,
         label: format!("?? t?o SRT: {}", srt_path.display()),
+    });
+    Ok((srt_path, timed_lines, word_segments))
+}
+
+fn build_video_srt_with_gemini_background(
+    job_id: u64,
+    api_key: &str,
+    lines: &[BookLine],
+    speeches: &[ExportedSpeech],
+    audiobook_path: &Path,
+    output_dir: &Path,
+    pause_ms: u32,
+    enable_word_highlight: bool,
+    subtitle_lead_seconds: f64,
+    cancel_flag: &AtomicBool,
+    progress_tx: Sender<SrtJobEvent>,
+) -> Result<(PathBuf, Vec<TimedBookLine>, Vec<TimedWordSegment>)> {
+    ensure_project_structure(output_dir)?;
+    ensure_not_cancelled(cancel_flag, "SRT generation cancelled.")?;
+    let _ = progress_tx.send(SrtJobEvent::Progress {
+        job_id,
+        fraction: 0.05,
+        label: "Preparing audio for Gemini...".to_string(),
+    });
+    let compressed_audio_path = project_subtitle_dir(output_dir).join("audiobook_for_gemini.mp3");
+    compress_audio_for_gemini(audiobook_path, &compressed_audio_path)?;
+    ensure_not_cancelled(cancel_flag, "Video export cancelled.")?;
+    let sentence_items = collect_sentence_items(lines, speeches, pause_ms)?;
+    if sentence_items.is_empty() {
+        return Err(anyhow!("Could not prepare sentence list for SRT."));
+    }
+    let _ = progress_tx.send(SrtJobEvent::Progress {
+        job_id,
+        fraction: 0.16,
+        label: "Creating sentence timing with Gemini...".to_string(),
+    });
+    let mut timed_lines =
+        analyze_sentence_timing_with_gemini(api_key, &compressed_audio_path, &sentence_items)?;
+    ensure_not_cancelled(cancel_flag, "SRT generation cancelled.")?;
+    apply_subtitle_lead_to_lines(&mut timed_lines, subtitle_lead_seconds);
+    let mut word_segments = if enable_word_highlight {
+        let _ = progress_tx.send(SrtJobEvent::Progress {
+            job_id,
+            fraction: 0.23,
+            label: "Creating word timing with Gemini...".to_string(),
+        });
+        let word_items = collect_word_items(&timed_lines);
+        let segments =
+            analyze_word_timing_with_gemini(api_key, &compressed_audio_path, &word_items)?;
+        ensure_not_cancelled(cancel_flag, "SRT generation cancelled.")?;
+        segments
+    } else {
+        let _ = progress_tx.send(SrtJobEvent::Progress {
+            job_id,
+            fraction: 0.23,
+            label: "Skipping word timing. Sentence timing only.".to_string(),
+        });
+        Vec::new()
+    };
+    apply_subtitle_lead_to_word_segments(&mut word_segments, subtitle_lead_seconds);
+    let srt_path = next_numbered_file_path(&project_subtitle_dir(output_dir), "subtitles", "srt")?;
+    fs::write(&srt_path, build_srt_content(&timed_lines))
+        .with_context(|| format!("Could not write {}", srt_path.display()))?;
+    let word_path = word_timing_path_for_srt(&srt_path);
+    if enable_word_highlight {
+        fs::write(
+            &word_path,
+            serde_json::to_string_pretty(&word_segments)
+                .context("Could not serialize word timing JSON")?,
+        )
+        .with_context(|| format!("Could not write {}", word_path.display()))?;
+    } else if word_path.exists() {
+        let _ = fs::remove_file(&word_path);
+    }
+    let _ = progress_tx.send(SrtJobEvent::Progress {
+        job_id,
+        fraction: 1.0,
+        label: format!("SRT ready: {}", srt_path.display()),
     });
     Ok((srt_path, timed_lines, word_segments))
 }
@@ -8867,6 +9880,9 @@ fn analyze_word_timing_with_gemini(
 
 fn find_preview_audio_for_srt(srt_path: &Path) -> Option<PathBuf> {
     let root = normalize_project_root(srt_path);
+    if let Some(path) = find_latest_audiobook_in_project(&root) {
+        return Some(path);
+    }
     let candidates = [
         project_audio_dir(&root).join("audiobook.wav"),
         project_audio_dir(&root).join("audiobook.mp3"),
@@ -8905,6 +9921,10 @@ fn export_video_from_cache(
     text_color: &str,
     card_opacity: u8,
     font_size: u32,
+    corner_tag: &str,
+    tag_font_size: u32,
+    tag_background_enabled: bool,
+    tag_position: VideoTagPosition,
     resolution: VideoResolution,
     frame_rate: VideoFrameRate,
     pause_ms: u32,
@@ -8914,8 +9934,12 @@ fn export_video_from_cache(
     cached_word_segments: &[TimedWordSegment],
     cached_srt_path: &str,
     cached_audio_path: &str,
+    subtitle_lead_seconds: f64,
+    cancel_flag: &AtomicBool,
     progress_tx: Sender<VideoEvent>,
 ) -> Result<PathBuf> {
+    ensure_not_cancelled(cancel_flag, "Video export cancelled.")?;
+    ensure_not_cancelled(cancel_flag, "Preview export cancelled.")?;
     if !audiobook_path.exists() {
         return Err(anyhow!("Kh?ng tim thay audiobook de xuat video."));
     }
@@ -8947,6 +9971,8 @@ fn export_video_from_cache(
             output_dir,
             pause_ms,
             enable_word_highlight,
+            subtitle_lead_seconds,
+            cancel_flag,
             progress_tx.clone(),
         )?;
         (timed_lines, word_segments, path)
@@ -8963,6 +9989,10 @@ fn export_video_from_cache(
         text_color,
         card_opacity,
         font_size,
+        corner_tag,
+        tag_font_size,
+        tag_background_enabled,
+        tag_position,
     );
     fs::write(&subtitle_path, ass_content)
         .with_context(|| format!("Kh?ng ghi duoc {}", subtitle_path.display()))?;
@@ -8974,7 +10004,15 @@ fn export_video_from_cache(
 
     let ffmpeg = find_ffmpeg()?;
     let mut command = Command::new(ffmpeg);
-    command.arg("-y").args(["-progress", "pipe:1", "-nostats"]);
+    command.arg("-y").args([
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        "-filter_threads",
+        "1",
+        "-filter_complex_threads",
+        "1",
+    ]);
     if let Some(ref path) = background_path {
         if path.exists() {
             command
@@ -9009,9 +10047,13 @@ fn export_video_from_cache(
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        "ultrafast",
         "-tune",
         "stillimage",
+        "-threads",
+        "2",
+        "-profile:v",
+        "baseline",
         "-pix_fmt",
         "yuv420p",
     ]);
@@ -9068,6 +10110,12 @@ fn export_video_from_cache(
 
     let mut last_reported = 0.12f32;
     for line in progress_reader.lines() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_handle.join();
+            return Err(anyhow!("Video export cancelled."));
+        }
         let line = line.unwrap_or_default();
         if let Some(value) = line.strip_prefix("out_time_us=") {
             if let Ok(out_time_us) = value.trim().parse::<u64>() {
@@ -9109,13 +10157,19 @@ fn export_video_preview_segment(
     text_color: &str,
     card_opacity: u8,
     font_size: u32,
+    corner_tag: &str,
+    tag_font_size: u32,
+    tag_background_enabled: bool,
+    tag_position: VideoTagPosition,
     resolution: VideoResolution,
     frame_rate: VideoFrameRate,
     word_segments: &[TimedWordSegment],
     start_seconds: f64,
     duration_seconds: f64,
+    cancel_flag: &AtomicBool,
     progress_tx: Sender<VideoEvent>,
 ) -> Result<PathBuf> {
+    ensure_not_cancelled(cancel_flag, "Preview export cancelled.")?;
     if !audiobook_path.exists() {
         return Err(anyhow!("Kh?ng tim thay audiobook de xuat preview video."));
     }
@@ -9165,6 +10219,10 @@ fn export_video_preview_segment(
         text_color,
         card_opacity,
         font_size,
+        corner_tag,
+        tag_font_size,
+        tag_background_enabled,
+        tag_position,
     );
     fs::write(&subtitle_path, ass_content)
         .with_context(|| format!("Kh?ng ghi duoc {}", subtitle_path.display()))?;
@@ -9274,6 +10332,12 @@ fn export_video_preview_segment(
     });
 
     for line in progress_reader.lines() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_handle.join();
+            return Err(anyhow!("Preview export cancelled."));
+        }
         let line = line.unwrap_or_default();
         if let Some(value) = line.strip_prefix("out_time_us=") {
             if let Ok(out_time_us) = value.trim().parse::<u64>() {
@@ -9436,6 +10500,10 @@ fn build_ass_subtitles(
     text_color: &str,
     card_opacity: u8,
     font_size: u32,
+    corner_tag: &str,
+    tag_font_size: u32,
+    tag_background_enabled: bool,
+    tag_position: VideoTagPosition,
 ) -> String {
     let primary = ass_color_from_hex(text_color, "FFFFFF");
     let faded = ass_color_with_alpha(text_color, "FFFFFF", "88");
@@ -9450,6 +10518,14 @@ fn build_ass_subtitles(
     let card_right = width.saturating_sub(card_left);
     let card_top = (height as f32 * 0.56).round() as u32;
     let card_bottom = (height as f32 * 0.90).round() as u32;
+    let tag_size = estimate_tag_square_size(corner_tag, tag_font_size);
+    let tag_left = match tag_position {
+        VideoTagPosition::TopLeft => 0,
+        VideoTagPosition::TopCenter => width.saturating_sub(tag_size) / 2,
+    };
+    let tag_top = 0;
+    let tag_right = tag_left + tag_size;
+    let tag_bottom = tag_top + tag_size;
 
     let rendered = lines
         .iter()
@@ -9483,6 +10559,12 @@ fn build_ass_subtitles(
         previous_size.max(18),
         faded
     ));
+    out.push_str(&format!(
+        "Style: TagText,{},{},{},&H000000FF,&H64000000,&H82000000,-1,0,0,0,100,100,0,0,1,2,1,5,20,20,20,1\n",
+        font_name,
+        tag_font_size.clamp(24, 120),
+        primary
+    ));
     out.push_str("Style: Card,Tahoma,20,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n");
     out.push_str("[Events]\n");
     out.push_str("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
@@ -9496,6 +10578,23 @@ fn build_ass_subtitles(
             card_alpha,
             build_ass_rounded_rect_path(card_left, card_top, card_right, card_bottom, radius)
         ));
+        if !corner_tag.trim().is_empty() {
+            if tag_background_enabled {
+                out.push_str(&format!(
+                    "Dialogue: 0,0:00:00.00,{},Card,,0,0,0,,{{\\p1\\bord0\\shad0\\1c&H000000&\\1a&H{}&}}{}\n",
+                    full_end,
+                    card_alpha,
+                    build_ass_rect_path(tag_left, tag_top, tag_right, tag_bottom)
+                ));
+            }
+            out.push_str(&format!(
+                "Dialogue: 5,0:00:00.00,{},TagText,,0,0,0,,{{\\an7\\pos({},{})}}{}\n",
+                full_end,
+                tag_left + 14,
+                tag_top + 14,
+                escape_ass_text(corner_tag.trim())
+            ));
+        }
     }
 
     let states = (0..lines.len())
@@ -9779,6 +10878,21 @@ fn build_ass_rounded_rect_path(left: u32, top: u32, right: u32, bottom: u32, rad
     )
 }
 
+fn build_ass_rect_path(left: u32, top: u32, right: u32, bottom: u32) -> String {
+    format!(
+        "m {} {} l {} {} l {} {} l {} {} l {} {}",
+        left, top, right, top, right, bottom, left, bottom, left, top
+    )
+}
+
+fn estimate_tag_square_size(tag_text: &str, font_size: u32) -> u32 {
+    let text = tag_text.trim();
+    let char_count = text.chars().count().max(1) as f32;
+    let estimated_width = char_count * font_size as f32 * 0.42;
+    let padded = estimated_width + font_size as f32 * 0.9;
+    padded.round().clamp(110.0, 300.0) as u32
+}
+
 fn word_segments_for_line<'a>(
     word_segments: &'a [TimedWordSegment],
     line_index: usize,
@@ -9956,8 +11070,17 @@ fn find_ffmpeg() -> Result<PathBuf> {
 
 fn ensure_sentence_like_text(text: &str) -> String {
     let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
     if trimmed.ends_with(['.', '!', '?']) {
         trimmed.to_string()
+    } else if let Some(stripped) = trimmed.strip_suffix(',') {
+        format!("{}.", stripped.trim_end())
+    } else if let Some(stripped) = trimmed.strip_suffix(';') {
+        format!("{}.", stripped.trim_end())
+    } else if let Some(stripped) = trimmed.strip_suffix(':') {
+        format!("{}.", stripped.trim_end())
     } else {
         format!("{trimmed}.")
     }
@@ -10293,17 +11416,41 @@ fn qwen_service_generate_with_chunking(
     fs::create_dir_all(temp_dir)
         .with_context(|| format!("Kh?ng tao duoc thu muc {}", temp_dir.display()))?;
 
-    let segments = split_tts_segments(target_text);
-    let mut all_samples = Vec::new();
     let mut resolved_ref_text = ref_text.to_string();
+    let full_file = temp_dir.join("full.wav");
+    let normalized_target_text = ensure_sentence_like_text(target_text);
+
+    if let Ok(result) = qwen_service_generate_retry(
+        base_url,
+        ref_audio_path,
+        &resolved_ref_text,
+        &normalized_target_text,
+        language,
+        xvector_only,
+        &full_file,
+    ) {
+        if resolved_ref_text.trim().is_empty() && !result.ref_text.trim().is_empty() {
+            resolved_ref_text = result.ref_text.clone();
+        }
+        let samples = read_wav_samples(Path::new(&result.output_path))?;
+        let _ = fs::remove_file(&full_file);
+        return Ok(QwenChunkedResult {
+            samples,
+            ref_text: resolved_ref_text,
+        });
+    }
+
+    let segments = split_tts_segments(&normalized_target_text);
+    let mut all_samples = Vec::new();
 
     for (index, segment) in segments.iter().enumerate() {
         let temp_file = temp_dir.join(format!("chunk_{index:03}.wav"));
+        let normalized_segment = ensure_sentence_like_text(segment);
         let result = qwen_service_generate_retry(
             base_url,
             ref_audio_path,
             &resolved_ref_text,
-            segment,
+            &normalized_segment,
             language,
             xvector_only,
             &temp_file,
@@ -10313,7 +11460,7 @@ fn qwen_service_generate_with_chunking(
                 base_url,
                 ref_audio_path,
                 &resolved_ref_text,
-                target_text,
+                &normalized_segment,
                 language,
                 xvector_only,
                 &temp_file,
@@ -10688,5 +11835,10 @@ fn main() -> Result<()> {
     )
     .map_err(|err| anyhow!("Kh?ng khoi dong duoc UI: {err}"))
 }
+
+
+
+
+
 
 
