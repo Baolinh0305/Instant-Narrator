@@ -18,7 +18,7 @@ use std::os::windows::process::CommandExt;
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use eframe::egui;
-use image::ImageReader;
+use image::{ImageReader, imageops::FilterType};
 use native_tls::{TlsConnector, TlsStream};
 use rodio::{OutputStream, OutputStreamBuilder, Sink, buffer::SamplesBuffer};
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,9 @@ const VIDEO_FONT_OPTIONS: &[&str] = &[
 ];
 const DEFAULT_VIDEO_FONT_SIZE: u32 = 60;
 const DEFAULT_VIDEO_SUBTITLE_LEAD_SECONDS: f32 = 0.0;
+const GROQ_SRT_MODEL_TURBO: &str = "whisper-large-v3-turbo";
+const GROQ_SRT_MODEL_STANDARD: &str = "whisper-large-v3";
+const GROQ_TRANSCRIBE_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 
 const MALE_VOICES: &[&str] = &[
     "Achird",
@@ -189,6 +192,55 @@ impl VideoFrameRate {
         match self {
             Self::Fps30 => 30,
             Self::Fps60 => 60,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum VideoSrtProvider {
+    Gemini,
+    GroqWhisper,
+}
+
+impl Default for VideoSrtProvider {
+    fn default() -> Self {
+        Self::Gemini
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum GroqSrtModel {
+    WhisperLargeV3Turbo,
+    WhisperLargeV3,
+}
+
+impl Default for GroqSrtModel {
+    fn default() -> Self {
+        Self::WhisperLargeV3Turbo
+    }
+}
+
+impl GroqSrtModel {
+    fn api_name(self) -> &'static str {
+        match self {
+            Self::WhisperLargeV3Turbo => GROQ_SRT_MODEL_TURBO,
+            Self::WhisperLargeV3 => GROQ_SRT_MODEL_STANDARD,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::WhisperLargeV3Turbo => "whisper-large-v3-turbo",
+            Self::WhisperLargeV3 => "whisper-large-v3",
+        }
+    }
+}
+
+impl VideoSrtProvider {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Gemini => "Gemini",
+            Self::GroqWhisper => "Groq (whisper-large-v3-turbo)",
         }
     }
 }
@@ -356,6 +408,7 @@ impl Default for SpeakerExportMode {
 #[serde(default)]
 struct PersistedState {
     api_key: String,
+    groq_api_key: String,
     book_input: String,
     book_output: String,
     characters: Vec<CharacterRecord>,
@@ -382,7 +435,8 @@ struct PersistedState {
     video_srt_path: String,
     video_preview_audio_path: String,
     video_preview_clip_duration_seconds: u32,
-    video_word_highlight_enabled: bool,
+    video_srt_provider: VideoSrtProvider,
+    groq_srt_model: GroqSrtModel,
     video_subtitle_lead_seconds: f32,
 }
 
@@ -390,6 +444,7 @@ impl Default for PersistedState {
     fn default() -> Self {
         Self {
             api_key: String::new(),
+            groq_api_key: String::new(),
             book_input: String::new(),
             book_output: String::new(),
             characters: Vec::new(),
@@ -416,7 +471,8 @@ impl Default for PersistedState {
             video_srt_path: String::new(),
             video_preview_audio_path: String::new(),
             video_preview_clip_duration_seconds: 12,
-            video_word_highlight_enabled: true,
+            video_srt_provider: VideoSrtProvider::Gemini,
+            groq_srt_model: GroqSrtModel::WhisperLargeV3Turbo,
             video_subtitle_lead_seconds: DEFAULT_VIDEO_SUBTITLE_LEAD_SECONDS,
         }
     }
@@ -564,16 +620,19 @@ enum VideoTagPosition {
 
 enum LineRenderEvent {
     Status {
+        project_root: String,
         engine: ExportEngine,
         index: usize,
         message: String,
     },
     Rendered {
+        project_root: String,
         engine: ExportEngine,
         speech: ExportedSpeech,
         message: String,
     },
     Error {
+        project_root: String,
         engine: ExportEngine,
         index: usize,
         error: String,
@@ -582,6 +641,8 @@ enum LineRenderEvent {
 
 struct TtsApp {
     api_key: String,
+    groq_api_key: String,
+    show_groq_api_key: bool,
     text: String,
     preview_text: String,
     style_instruction: String,
@@ -607,6 +668,7 @@ struct TtsApp {
     line_render_tx: Sender<LineRenderEvent>,
     line_render_rx: Receiver<LineRenderEvent>,
     cancel_flag: Arc<AtomicBool>,
+    auto_export_after_tts: bool,
     stream: Option<OutputStream>,
     sink: Option<Sink>,
     last_audio_samples: Option<Vec<i16>>,
@@ -680,7 +742,8 @@ struct TtsApp {
     video_progress_label: String,
     video_timed_lines: Vec<TimedBookLine>,
     video_word_segments: Vec<TimedWordSegment>,
-    video_word_highlight_enabled: bool,
+    video_srt_provider: VideoSrtProvider,
+    groq_srt_model: GroqSrtModel,
     video_subtitle_lead_seconds: f32,
     video_srt_path: String,
     video_preview_started_at: Option<Instant>,
@@ -709,8 +772,15 @@ impl Default for TtsApp {
         } else {
             persisted.api_key.clone()
         };
+        let initial_groq_api_key = if persisted.groq_api_key.trim().is_empty() {
+            std::env::var("GROQ_API_KEY").unwrap_or_default()
+        } else {
+            persisted.groq_api_key.clone()
+        };
         let mut app = Self {
             api_key: initial_api_key,
+            groq_api_key: initial_groq_api_key,
+            show_groq_api_key: false,
             text: String::new(),
             preview_text: DEFAULT_PREVIEW_TEXT.to_string(),
             style_instruction: "Read naturally, clearly, and with the right emotional context.".to_string(),
@@ -736,6 +806,7 @@ impl Default for TtsApp {
             line_render_tx,
             line_render_rx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            auto_export_after_tts: false,
             stream: None,
             sink: None,
             last_audio_samples: None,
@@ -831,7 +902,8 @@ impl Default for TtsApp {
             video_progress_label: String::new(),
             video_timed_lines: Vec::new(),
             video_word_segments: Vec::new(),
-            video_word_highlight_enabled: persisted.video_word_highlight_enabled,
+            video_srt_provider: persisted.video_srt_provider,
+            groq_srt_model: persisted.groq_srt_model,
             video_subtitle_lead_seconds: persisted
                 .video_subtitle_lead_seconds
                 .clamp(0.0, 1.5),
@@ -898,10 +970,17 @@ impl TtsApp {
             match self.line_render_rx.try_recv() {
                 Ok(event) => match event {
                     LineRenderEvent::Status {
+                        project_root,
                         engine,
                         index,
                         message,
                     } => {
+                        let is_current_project = !self.last_export_dir.trim().is_empty()
+                            && normalize_separators(Path::new(&project_root))
+                                == normalize_separators(&normalize_project_root(Path::new(&self.last_export_dir)));
+                        if !is_current_project {
+                            continue;
+                        }
                         self.export_status = message.clone();
                         match engine {
                             ExportEngine::Qwen => {
@@ -917,10 +996,27 @@ impl TtsApp {
                         }
                     }
                     LineRenderEvent::Rendered {
+                        project_root,
                         engine,
                         speech,
                         message,
                     } => {
+                        let is_current_project = !self.last_export_dir.trim().is_empty()
+                            && normalize_separators(Path::new(&project_root))
+                                == normalize_separators(&normalize_project_root(Path::new(&self.last_export_dir)));
+                        if !is_current_project {
+                            match engine {
+                                ExportEngine::Qwen => {
+                                    self.active_qwen_line_renders =
+                                        self.active_qwen_line_renders.saturating_sub(1);
+                                }
+                                ExportEngine::Gemini => {
+                                    self.active_gemini_line_renders =
+                                        self.active_gemini_line_renders.saturating_sub(1);
+                                }
+                            }
+                            continue;
+                        }
                         self.exported_speeches.retain(|item| item.index != speech.index);
                         self.exported_speeches.push(speech.clone());
                         self.exported_speeches.sort_by_key(|item| item.index);
@@ -947,10 +1043,27 @@ impl TtsApp {
                         let _ = self.persist_state_to_disk();
                     }
                     LineRenderEvent::Error {
+                        project_root,
                         engine,
                         index,
                         error,
                     } => {
+                        let is_current_project = !self.last_export_dir.trim().is_empty()
+                            && normalize_separators(Path::new(&project_root))
+                                == normalize_separators(&normalize_project_root(Path::new(&self.last_export_dir)));
+                        if !is_current_project {
+                            match engine {
+                                ExportEngine::Qwen => {
+                                    self.active_qwen_line_renders =
+                                        self.active_qwen_line_renders.saturating_sub(1);
+                                }
+                                ExportEngine::Gemini => {
+                                    self.active_gemini_line_renders =
+                                        self.active_gemini_line_renders.saturating_sub(1);
+                                }
+                            }
+                            continue;
+                        }
                         self.export_status = format!("Render line failed: {}", error);
                         match engine {
                             ExportEngine::Qwen => {
@@ -1017,15 +1130,50 @@ impl TtsApp {
     fn clear_speech_cache(&mut self) {
         self.exported_speeches.clear();
         self.export_skip_details.clear();
+        self.export_skipped_indices.clear();
         self.last_audiobook_path.clear();
+        self.video_preview_audio_path.clear();
+        self.video_srt_path.clear();
+        self.video_timed_lines.clear();
+        self.video_word_segments.clear();
+        self.last_video_export_path.clear();
         let cache_dir = app_data_dir().join("speech-cache").join("latest");
         let _ = fs::remove_dir_all(&cache_dir);
         let _ = fs::create_dir_all(&cache_dir);
+        if !self.last_export_dir.trim().is_empty() {
+            let root = normalize_project_root(Path::new(&self.last_export_dir));
+            let _ = clear_directory_files(&project_audio_lines_dir(&root));
+            let _ = clear_directory_files(&project_audio_dir(&root));
+            let _ = clear_directory_files(&project_subtitle_dir(&root));
+        }
         let _ = self.persist_state_to_disk();
     }
 
     fn can_export_video(&self) -> bool {
         !parse_book_lines(&self.book_output).is_empty() && self.missing_cached_book_line_indices().is_empty()
+    }
+
+    fn save_project_video_tag_snapshot(&mut self) -> Result<()> {
+        if self.last_export_dir.trim().is_empty() {
+            return Ok(());
+        }
+        let root = normalize_project_root(Path::new(&self.last_export_dir));
+        write_project_video_tag(&root, self.video_corner_tag.trim())?;
+        self.last_export_dir = root.to_string_lossy().to_string();
+        let _ = self.persist_state_to_disk();
+        Ok(())
+    }
+
+    fn ensure_video_tag_ready(&mut self) -> Result<String> {
+        let root = self.ensure_active_project_root()?;
+        let tag = self.video_corner_tag.trim().to_string();
+        if tag.is_empty() {
+            return Err(anyhow!(
+                "This project does not have a Video tag yet. Fill in the Video tag field before exporting video."
+            ));
+        }
+        write_project_video_tag(&root, &tag)?;
+        Ok(tag)
     }
 
     fn save_project_text_snapshot(&mut self) -> Result<()> {
@@ -1038,6 +1186,25 @@ impl TtsApp {
         self.last_export_dir = root.to_string_lossy().to_string();
         let _ = self.persist_state_to_disk();
         Ok(())
+    }
+
+    fn ensure_active_project_root(&mut self) -> Result<PathBuf> {
+        let root = if self.last_export_dir.trim().is_empty()
+            || self.last_export_dir.trim() == EXPORT_DIR
+        {
+            next_project_root_dir()?
+        } else {
+            normalize_project_root(Path::new(&self.last_export_dir))
+        };
+        ensure_project_structure(&root)?;
+        self.last_export_dir = root.to_string_lossy().to_string();
+        let _ = self.persist_state_to_disk();
+        Ok(root)
+    }
+
+    fn project_line_cache_path(&mut self, index: usize) -> Result<PathBuf> {
+        let root = self.ensure_active_project_root()?;
+        Ok(project_audio_lines_dir(&root).join(format!("{:04}.wav", index + 1)))
     }
 
     fn set_book_line_speaker(&mut self, index: usize, speaker: &str) {
@@ -1081,11 +1248,18 @@ impl TtsApp {
         self.export_skip_details
             .retain(|item| !item.starts_with(&format!("D?ng {} ", index + 1)));
         self.export_skipped_indices.retain(|item| *item != index);
-        let cache_path = app_data_dir()
+        let app_cache_path = app_data_dir()
             .join("speech-cache")
             .join("latest")
             .join(format!("{:04}.wav", index + 1));
-        let _ = fs::remove_file(cache_path);
+        let _ = fs::remove_file(app_cache_path);
+        if !self.last_export_dir.trim().is_empty() {
+            let project_cache_path = normalize_project_root(Path::new(&self.last_export_dir))
+                .join("audio")
+                .join("lines")
+                .join(format!("{:04}.wav", index + 1));
+            let _ = fs::remove_file(project_cache_path);
+        }
         self.last_audiobook_path.clear();
         self.video_srt_path.clear();
         self.video_timed_lines.clear();
@@ -1150,17 +1324,7 @@ impl TtsApp {
             self.video_preview_texture = None;
             self.video_preview_texture_path.clear();
         }
-        let word_path = word_timing_path_for_srt(path);
-        self.video_word_segments = if self.video_word_highlight_enabled && word_path.exists() {
-            let mut segments = load_word_timing_file(&word_path).unwrap_or_default();
-            apply_subtitle_lead_to_word_segments(
-                &mut segments,
-                self.video_subtitle_lead_seconds as f64,
-            );
-            segments
-        } else {
-            Vec::new()
-        };
+        self.video_word_segments.clear();
         self.video_preview_seek_seconds = 0.0;
         self.video_preview_started_at = None;
         self.video_preview_line_index = 0;
@@ -1362,6 +1526,13 @@ impl TtsApp {
             self.video_status = "Speech cache is incomplete. Video export is unavailable.".to_string();
             return;
         }
+        let corner_tag = match self.ensure_video_tag_ready() {
+            Ok(tag) => tag,
+            Err(err) => {
+                self.video_status = err.to_string();
+                return;
+            }
+        };
         let current_project_root = if self.last_export_dir.trim().is_empty() {
             match next_project_root_dir() {
                 Ok(dir) => dir,
@@ -1415,18 +1586,30 @@ impl TtsApp {
         let text_color = self.video_text_color.trim().to_string();
         let card_opacity = self.video_card_opacity;
         let font_size = self.video_font_size.clamp(20, 96);
-        let corner_tag = self.video_corner_tag.trim().to_string();
         let tag_font_size = self.video_tag_font_size.clamp(36, 120);
         let tag_background_enabled = self.video_tag_background_enabled;
         let tag_position = self.video_tag_position;
         let resolution = self.video_resolution;
         let frame_rate = self.video_frame_rate;
         let pause_ms = self.audiobook_pause_ms;
-        let enable_word_highlight = self.video_word_highlight_enabled;
         let subtitle_lead_seconds = self.video_subtitle_lead_seconds as f64;
-        let api_key = self.api_key.trim().to_string();
+        let gemini_api_key = self.api_key.trim().to_string();
+        let groq_api_key = self.groq_api_key.trim().to_string();
+        let groq_srt_model = self.groq_srt_model;
+        let srt_provider = self.video_srt_provider;
+        match srt_provider {
+            VideoSrtProvider::Gemini if gemini_api_key.is_empty() => {
+                self.video_status = "Missing Gemini API key for SRT creation.".to_string();
+                return;
+            }
+            VideoSrtProvider::GroqWhisper if groq_api_key.is_empty() => {
+                self.video_status = "Missing Groq API key for SRT creation.".to_string();
+                return;
+            }
+            _ => {}
+        }
         let cached_timed_lines = self.video_timed_lines.clone();
-        let cached_word_segments = self.video_word_segments.clone();
+        let cached_word_segments = Vec::new();
         let cached_srt_path = self.video_srt_path.clone();
         let cached_audio_path = self.video_preview_audio_path.clone();
 
@@ -1459,8 +1642,10 @@ impl TtsApp {
                 resolution,
                 frame_rate,
                 pause_ms,
-                &api_key,
-                enable_word_highlight,
+                srt_provider,
+                &gemini_api_key,
+                &groq_api_key,
+                groq_srt_model,
                 &cached_timed_lines,
                 &cached_word_segments,
                 &cached_srt_path,
@@ -1490,6 +1675,13 @@ impl TtsApp {
             self.video_status = "Speech cache is incomplete. Preview export is unavailable.".to_string();
             return;
         }
+        let corner_tag = match self.ensure_video_tag_ready() {
+            Ok(tag) => tag,
+            Err(err) => {
+                self.video_status = err.to_string();
+                return;
+            }
+        };
 
         let output_dir = if !self.last_export_dir.trim().is_empty() {
             let dir = normalize_project_root(Path::new(&self.last_export_dir));
@@ -1531,7 +1723,6 @@ impl TtsApp {
         let text_color = self.video_text_color.trim().to_string();
         let card_opacity = self.video_card_opacity;
         let font_size = self.video_font_size.clamp(20, 96);
-        let corner_tag = self.video_corner_tag.trim().to_string();
         let tag_font_size = self.video_tag_font_size.clamp(36, 120);
         let tag_background_enabled = self.video_tag_background_enabled;
         let tag_position = self.video_tag_position;
@@ -1539,7 +1730,7 @@ impl TtsApp {
         let frame_rate = self.video_frame_rate;
         let background_path = trimmed_path(&self.video_background_path);
         let timed_lines = self.video_timed_lines.clone();
-        let word_segments = self.video_word_segments.clone();
+        let word_segments = Vec::new();
 
         self.is_exporting_video = true;
         self.video_cancel_flag = Arc::new(AtomicBool::new(false));
@@ -1614,10 +1805,19 @@ impl TtsApp {
                 return;
             }
         };
-        let api_key = self.api_key.trim().to_string();
-        if api_key.is_empty() {
-            self.video_status = "Missing Gemini API key for SRT creation.".to_string();
-            return;
+        let gemini_api_key = self.api_key.trim().to_string();
+        let groq_api_key = self.groq_api_key.trim().to_string();
+        let groq_srt_model = self.groq_srt_model;
+        match self.video_srt_provider {
+            VideoSrtProvider::Gemini if gemini_api_key.is_empty() => {
+                self.video_status = "Missing Gemini API key for SRT creation.".to_string();
+                return;
+            }
+            VideoSrtProvider::GroqWhisper if groq_api_key.is_empty() => {
+                self.video_status = "Missing Groq API key for SRT creation.".to_string();
+                return;
+            }
+            _ => {}
         }
 
         let lines = parse_book_lines(&self.book_output);
@@ -1644,9 +1844,17 @@ impl TtsApp {
             self.video_status = format!("Could not prepare the project for SRT creation: {}", err);
             return;
         }
+        if let Err(err) = clear_existing_subtitle_artifacts(&output_dir, self.video_srt_provider) {
+            self.video_status = format!("Could not clear previous subtitle files: {}", err);
+            return;
+        }
+        self.video_srt_path.clear();
+        self.video_timed_lines.clear();
+        self.video_word_segments.clear();
+        self.video_preview_audio_path.clear();
         let pause_ms = self.audiobook_pause_ms;
-        let enable_word_highlight = self.video_word_highlight_enabled;
         let subtitle_lead_seconds = self.video_subtitle_lead_seconds as f64;
+        let srt_provider = self.video_srt_provider;
         let job_id = self.next_srt_job_id;
         self.next_srt_job_id += 1;
         let project_root_string = output_dir.to_string_lossy().to_string();
@@ -1663,8 +1871,9 @@ impl TtsApp {
             failed: false,
         });
         self.video_status = format!(
-            "Started background SRT job #{} for {}",
+            "Started background SRT job #{} with {} for {}",
             job_id,
+            srt_provider.label(),
             audiobook_path.display()
         );
         let tx = self.srt_job_tx.clone();
@@ -1676,19 +1885,33 @@ impl TtsApp {
                 job_id,
                 message: "Preparing sentence list for SRT...".to_string(),
             });
-            let result = build_video_srt_with_gemini_background(
-                job_id,
-                &api_key,
-                &lines,
-                &speeches,
-                &audiobook_path,
-                &output_dir,
-                pause_ms,
-                enable_word_highlight,
-                subtitle_lead_seconds,
-                &cancel_flag,
-                tx.clone(),
-            );
+            let result = match srt_provider {
+                VideoSrtProvider::Gemini => build_video_srt_with_gemini_background(
+                    job_id,
+                    &gemini_api_key,
+                    &lines,
+                    &speeches,
+                    &audiobook_path,
+                    &output_dir,
+                    pause_ms,
+                    subtitle_lead_seconds,
+                    &cancel_flag,
+                    tx.clone(),
+                ),
+                VideoSrtProvider::GroqWhisper => build_video_srt_with_groq_background(
+                    job_id,
+                    &groq_api_key,
+                    groq_srt_model,
+                    &lines,
+                    &speeches,
+                    &audiobook_path,
+                    &output_dir,
+                    pause_ms,
+                    subtitle_lead_seconds,
+                    &cancel_flag,
+                    tx.clone(),
+                ),
+            };
             match result {
                 Ok((path, timed_lines, word_segments)) => {
                     let _ = tx.send(SrtJobEvent::Ready {
@@ -1736,7 +1959,9 @@ impl TtsApp {
             return;
         }
         self.stop_audio();
-        match read_wav_samples(Path::new(&audio_path)).and_then(|samples| self.play_samples(samples)) {
+        match read_wav_samples(Path::new(&audio_path))
+            .and_then(|samples| self.play_samples_from_seconds(samples, self.video_preview_seek_seconds))
+        {
             Ok(()) => {
                 self.video_preview_started_at = Some(Instant::now());
                 self.video_preview_audio_path = audio_path;
@@ -1878,9 +2103,21 @@ impl TtsApp {
 
     fn missing_cached_book_line_indices(&self) -> Vec<usize> {
         let lines = parse_book_lines(&self.book_output);
+        let root = (!self.last_export_dir.trim().is_empty())
+            .then(|| normalize_project_root(Path::new(&self.last_export_dir)));
         let mut missing = Vec::new();
         for index in 0..lines.len() {
-            if self.exported_speeches.iter().all(|item| item.index != index) {
+            let expected_path_exists = root
+                .as_ref()
+                .map(|root| project_audio_lines_dir(root).join(format!("{:04}.wav", index + 1)).exists())
+                .unwrap_or_else(|| {
+                    self.exported_speeches.iter().any(|item| {
+                        item.index == index
+                            && !item.audio_path.trim().is_empty()
+                            && Path::new(&item.audio_path).exists()
+                    })
+                });
+            if !expected_path_exists {
                 missing.push(index);
             }
         }
@@ -1952,6 +2189,7 @@ impl TtsApp {
             dir
         };
         write_project_text_files(&output_dir, &self.book_input, &self.book_output)?;
+        self.exported_speeches = rebuild_project_speeches(&output_dir, &lines);
 
         let mut speeches = self.exported_speeches.clone();
         speeches.sort_by_key(|item| item.index);
@@ -2055,6 +2293,7 @@ impl TtsApp {
         self.video_background_path = latest_background_in_project(&root)
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default();
+        self.video_corner_tag = read_project_video_tag(&root)?.trim().to_string();
         self.video_preview_texture = None;
         self.video_preview_texture_path.clear();
         self.last_video_export_path = latest_video_in_project(&root)
@@ -2072,7 +2311,11 @@ impl TtsApp {
     }
 
     fn start_speak_main(&mut self) {
-        self.start_speak_with_text(self.text.trim().to_string(), false);
+        self.start_speak_with_text(self.text.trim().to_string(), false, false);
+    }
+
+    fn start_speak_main_and_export(&mut self) {
+        self.start_speak_with_text(self.text.trim().to_string(), false, true);
     }
 
     fn start_speak_preview(&mut self, voice: Option<String>) {
@@ -2088,23 +2331,26 @@ impl TtsApp {
             DEFAULT_PREVIEW_TEXT.to_string()
         };
 
-        self.start_speak_with_text(preview_text, true);
+        self.start_speak_with_text(preview_text, true, false);
     }
 
-    fn start_speak_with_text(&mut self, text: String, is_preview: bool) {
+    fn start_speak_with_text(&mut self, text: String, is_preview: bool, export_after: bool) {
         let api_key = self.api_key.trim().to_string();
         let voice_name = self.voice_name.trim().to_string();
 
         if api_key.is_empty() {
             self.status = "Thi?u Gemini API key.".to_string();
+            self.auto_export_after_tts = false;
             return;
         }
         if text.trim().is_empty() {
             self.status = "B?n chua nh?p van b?n c?n ??c.".to_string();
+            self.auto_export_after_tts = false;
             return;
         }
         if voice_name.is_empty() {
             self.status = "Voice name kh?ng ???c r?ng.".to_string();
+            self.auto_export_after_tts = false;
             return;
         }
 
@@ -2113,8 +2359,11 @@ impl TtsApp {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         self.cancel_flag = cancel_flag.clone();
         self.is_fetching = true;
+        self.auto_export_after_tts = export_after;
         self.status = if is_preview {
             format!("?ang preview voice {}...", self.voice_name)
+        } else if export_after {
+            "?ang g?i Gemini Live TTS (sau ?� s? xu?t WAV)...".to_string()
         } else {
             "?ang g?i Gemini Live TTS...".to_string()
         };
@@ -2265,6 +2514,7 @@ impl TtsApp {
     fn persisted_state(&self) -> PersistedState {
         PersistedState {
             api_key: self.api_key.trim().to_string(),
+            groq_api_key: self.groq_api_key.trim().to_string(),
             book_input: self.book_input.clone(),
             book_output: self.book_output.clone(),
             characters: self.characters.clone(),
@@ -2291,7 +2541,8 @@ impl TtsApp {
             video_srt_path: self.video_srt_path.clone(),
             video_preview_audio_path: self.video_preview_audio_path.clone(),
             video_preview_clip_duration_seconds: self.video_preview_clip_duration_seconds,
-            video_word_highlight_enabled: self.video_word_highlight_enabled,
+            video_srt_provider: self.video_srt_provider,
+            groq_srt_model: self.groq_srt_model,
             video_subtitle_lead_seconds: self.video_subtitle_lead_seconds,
         }
     }
@@ -2451,6 +2702,14 @@ impl TtsApp {
     }
 
     fn start_render_book_line(&mut self, index: usize) {
+        self.start_render_book_line_with_mode(index, false);
+    }
+
+    fn start_render_book_line_split(&mut self, index: usize) {
+        self.start_render_book_line_with_mode(index, true);
+    }
+
+    fn start_render_book_line_with_mode(&mut self, index: usize, force_split: bool) {
         let lines = parse_book_lines(&self.book_output);
         let Some(line) = lines.get(index).cloned() else {
             self.qwen_status = "D?ng tho?i kh?ng c?n h?p l?.".to_string();
@@ -2463,20 +2722,48 @@ impl TtsApp {
             return;
         };
 
+        if force_split && character.tts_engine != "gemini" {
+            self.qwen_status = format!(
+                "Line {} is not using Gemini Live. Split render only works for Gemini lines.",
+                index + 1
+            );
+            self.export_status = self.qwen_status.clone();
+            return;
+        }
+
         self.selected_book_line = Some(index);
-        self.qwen_status = format!("?ang render ri?ng d?ng {}...", index + 1);
-        self.export_status = format!("Rendering line {}...", index + 1);
+        self.qwen_status = if force_split {
+            format!("?ang render t?ch ?o?n d?ng {}...", index + 1)
+        } else {
+            format!("?ang render ri?ng d?ng {}...", index + 1)
+        };
+        self.export_status = if force_split {
+            format!("Rendering split line {}...", index + 1)
+        } else {
+            format!("Rendering line {}...", index + 1)
+        };
+        let output_path = match self.project_line_cache_path(index) {
+            Ok(path) => path,
+            Err(err) => {
+                self.qwen_status = format!("Could not prepare line cache path: {}", err);
+                self.export_status = self.qwen_status.clone();
+                return;
+            }
+        };
         let final_gain_percent =
             ((character.volume_percent as u64 * self.line_volume_percent(index) as u64) / 100)
                 .clamp(40, 400) as u32;
-        let output_path = app_data_dir()
-            .join("speech-cache")
-            .join("latest")
-            .join(format!("{:04}.wav", index + 1));
+        let event_project_root = normalize_project_root(&output_path)
+            .to_string_lossy()
+            .to_string();
 
         if character.tts_engine == "gemini" {
             self.active_gemini_line_renders += 1;
-            self.export_gemini_status = format!("Rendering line {} with Gemini...", index + 1);
+            self.export_gemini_status = if force_split {
+                format!("Rendering split line {} with Gemini...", index + 1)
+            } else {
+                format!("Rendering line {} with Gemini...", index + 1)
+            };
             self.export_qwen_status = "Qwen idle.".to_string();
             let api_key = self.api_key.trim().to_string();
             let voice_name = if character.gemini_voice.trim().is_empty() {
@@ -2485,19 +2772,36 @@ impl TtsApp {
                 character.gemini_voice.clone()
             };
             let tx = self.line_render_tx.clone();
+            let project_root = event_project_root.clone();
             thread::spawn(move || {
                 let _ = tx.send(LineRenderEvent::Status {
+                    project_root: project_root.clone(),
                     engine: ExportEngine::Gemini,
                     index,
-                    message: format!("Rendering Gemini for line {}...", index + 1),
+                    message: if force_split {
+                        format!("Rendering Gemini split for line {}...", index + 1)
+                    } else {
+                        format!("Rendering Gemini for line {}...", index + 1)
+                    },
                 });
-                let result = run_tts_job_resilient(&TtsJob {
+                let job = TtsJob {
                     api_key,
                     text: line.text.clone(),
                     style_instruction: character.gemini_style_prompt.clone(),
                     voice_name,
                     speed: character.gemini_speed,
-                })
+                };
+                let result = if force_split {
+                    synthesize_split_gemini_line(&job)
+                } else {
+                    run_gemini_line_with_split_guard(&job).map_err(|err| {
+                        anyhow!(
+                            "Gemini returned incomplete audio for line {}: {}",
+                            index + 1,
+                            err
+                        )
+                    })
+                }
                 .and_then(|samples| {
                     if let Some(parent) = output_path.parent() {
                         let _ = fs::create_dir_all(parent);
@@ -2516,13 +2820,19 @@ impl TtsApp {
                 match result {
                     Ok(speech) => {
                         let _ = tx.send(LineRenderEvent::Rendered {
+                            project_root: project_root.clone(),
                             engine: ExportEngine::Gemini,
                             speech,
-                            message: format!("Rendered line {} with Gemini.", index + 1),
+                            message: if force_split {
+                                format!("Rendered split line {} with Gemini.", index + 1)
+                            } else {
+                                format!("Rendered line {} with Gemini.", index + 1)
+                            },
                         });
                     }
                     Err(err) => {
                         let _ = tx.send(LineRenderEvent::Error {
+                            project_root: project_root,
                             engine: ExportEngine::Gemini,
                             index,
                             error: format!("Render d?ng {} th?t b?i: {}", index + 1, err),
@@ -2550,8 +2860,10 @@ impl TtsApp {
                 return;
             };
             let tx = self.line_render_tx.clone();
+            let project_root = event_project_root;
             thread::spawn(move || {
                 let _ = tx.send(LineRenderEvent::Status {
+                    project_root: project_root.clone(),
                     engine: ExportEngine::Qwen,
                     index,
                     message: format!("Rendering Qwen for line {}...", index + 1),
@@ -2586,6 +2898,7 @@ impl TtsApp {
                 match result {
                     Ok(speech) => {
                         let _ = tx.send(LineRenderEvent::Rendered {
+                            project_root: project_root.clone(),
                             engine: ExportEngine::Qwen,
                             speech,
                             message: format!("Rendered line {} with Qwen.", index + 1),
@@ -2593,6 +2906,7 @@ impl TtsApp {
                     }
                     Err(err) => {
                         let _ = tx.send(LineRenderEvent::Error {
+                            project_root: project_root,
                             engine: ExportEngine::Qwen,
                             index,
                             error: format!("Render d?ng {} th?t b?i: {}", index + 1, err),
@@ -2609,6 +2923,112 @@ impl TtsApp {
 
     fn start_render_selected_character_lines_grouped(&mut self) {
         self.start_render_selected_character_lines_with_mode(Some(ExportRenderMode::ByCharacter));
+    }
+
+    fn import_dropped_audio_to_line(&mut self, index: usize) {
+        let Some(path) = self.dropped_audio_path.clone() else {
+            self.export_status =
+                "No external audio was dropped yet. Drag-and-drop an audio file first.".to_string();
+            return;
+        };
+        self.import_external_audio_file_to_line(index, &path);
+    }
+
+    fn import_external_audio_file_to_line(&mut self, index: usize, path: &Path) {
+        let lines = parse_book_lines(&self.book_output);
+        let Some(line) = lines.get(index).cloned() else {
+            self.export_status = "Invalid line index for external audio import.".to_string();
+            return;
+        };
+        if !path.exists() {
+            self.export_status = format!("External audio file was not found: {}", path.display());
+            return;
+        }
+
+        let final_gain_percent = self.effective_gain_percent_for_line(index, &line.speaker);
+        let output_path = match self.project_line_cache_path(index) {
+            Ok(path) => path,
+            Err(err) => {
+                self.export_status = format!("Could not prepare project line cache path: {}", err);
+                return;
+            }
+        };
+
+        match read_audio_samples_any(path).and_then(|samples| {
+            let adjusted = apply_volume_percent(&samples, final_gain_percent);
+            write_samples_to_wav(&output_path, &adjusted)
+        }) {
+            Ok(()) => {
+                self.exported_speeches.retain(|item| item.index != index);
+                self.exported_speeches.push(ExportedSpeech {
+                    index,
+                    speaker: line.speaker.clone(),
+                    text: line.text.clone(),
+                    audio_path: output_path.to_string_lossy().to_string(),
+                    applied_gain_percent: final_gain_percent,
+                });
+                self.exported_speeches.sort_by_key(|item| item.index);
+                self.export_skipped_indices.retain(|item| *item != index);
+                self.export_skip_details.retain(|detail| {
+                    !detail.contains(&format!("line {}", index + 1))
+                        && !detail.contains(&format!("Dòng {}", index + 1))
+                });
+                self.selected_book_line = Some(index);
+
+                match self.rebuild_audiobook_from_cache() {
+                    Ok(()) => {
+                        self.export_status = format!(
+                            "Imported external audio to line {} and rebuilt audiobook.",
+                            index + 1
+                        );
+                    }
+                    Err(err) => {
+                        self.export_status = format!(
+                            "Imported external audio to line {}. Rebuild pending: {}",
+                            index + 1,
+                            err
+                        );
+                    }
+                }
+                let _ = self.persist_state_to_disk();
+            }
+            Err(err) => {
+                self.export_status = format!(
+                    "Could not import external audio to line {}: {}",
+                    index + 1,
+                    err
+                );
+            }
+        }
+    }
+
+    fn jump_to_video_timing_line(&mut self, index: usize, autoplay: bool) {
+        if index >= self.video_timed_lines.len() {
+            return;
+        }
+        let line = &self.video_timed_lines[index];
+        self.video_preview_line_index = index;
+        self.selected_book_line = Some(index);
+        self.video_preview_seek_seconds = line.start_seconds.max(0.0);
+        let preview_duration = ((line.end_seconds - line.start_seconds) + 1.2)
+            .clamp(3.0, 20.0)
+            .round() as u32;
+        self.video_preview_clip_duration_seconds = preview_duration.max(3);
+        self.video_preview_started_at = None;
+        if autoplay {
+            self.start_video_preview_playback();
+        }
+    }
+
+    fn save_current_video_srt(&mut self) -> Result<()> {
+        if self.video_srt_path.trim().is_empty() {
+            return Err(anyhow!("No SRT is currently loaded."));
+        }
+        let srt_path = PathBuf::from(self.video_srt_path.trim());
+        fs::write(&srt_path, build_srt_content(&self.video_timed_lines))
+            .with_context(|| format!("Could not write {}", srt_path.display()))?;
+        self.video_status = format!("Saved subtitle timing: {}", srt_path.display());
+        Ok(())
     }
 
     fn start_render_selected_character_lines_with_mode(
@@ -2861,7 +3281,7 @@ impl TtsApp {
                     )));
 
                     let result: Result<ExportedSpeech> = if character.tts_engine == "gemini" {
-                        run_tts_job_resilient(&TtsJob {
+                        run_gemini_line_with_split_guard(&TtsJob {
                             api_key: api_key.clone(),
                             text: task.line.text.clone(),
                             style_instruction: character.gemini_style_prompt.clone(),
@@ -2996,7 +3416,7 @@ impl TtsApp {
             let _ = tx.send(QwenEvent::Status(
                 "?ang g?i Gemini Live cho preview...".to_string(),
             ));
-            match run_tts_job_resilient(&job) {
+            match run_gemini_line_with_split_guard(&job) {
                 Ok(samples) => {
                     let _ = tx.send(QwenEvent::PreviewReady {
                         character_name,
@@ -3653,7 +4073,7 @@ impl TtsApp {
 
                                     for task in batch_tasks {
                                         let result = if engine == ExportEngine::Gemini {
-                                            run_tts_job_resilient(&TtsJob {
+                                            run_gemini_line_with_split_guard(&TtsJob {
                                                 api_key: api_key.clone(),
                                                 text: task.line.text.clone(),
                                                 style_instruction: character.gemini_style_prompt.clone(),
@@ -3853,7 +4273,7 @@ impl TtsApp {
 
                         let speaker = task.line.speaker.clone();
                         let text = task.line.text.clone();
-                        let result = run_tts_job_resilient(&TtsJob {
+                        let result = run_gemini_line_with_split_guard(&TtsJob {
                             api_key,
                             text: task.line.text.clone(),
                             style_instruction: task.character.gemini_style_prompt.clone(),
@@ -4242,17 +4662,32 @@ impl TtsApp {
         }
     }
     fn play_samples(&mut self, samples: Vec<i16>) -> Result<()> {
+        self.play_samples_from_seconds(samples, 0.0)
+    }
+
+    fn play_samples_from_seconds(&mut self, samples: Vec<i16>, start_seconds: f64) -> Result<()> {
         if samples.is_empty() {
             return Err(anyhow!("Kh?ng nh?n ???c audio t? Gemini."));
         }
 
-        self.last_audio_samples = Some(samples.clone());
+        let start_index = ((start_seconds.max(0.0)) * SAMPLE_RATE as f64).floor() as usize;
+        let sliced = if start_index >= samples.len() {
+            Vec::new()
+        } else {
+            samples[start_index..].to_vec()
+        };
+        if sliced.is_empty() {
+            return Err(anyhow!("Preview start is beyond the available audio."));
+        }
+
+        self.last_audio_samples = Some(sliced.clone());
 
         let stream = OutputStreamBuilder::open_default_stream()
             .context("Kh?ng mo duoc thiet bi am thanh mac dinh")?;
         let sink = Sink::connect_new(stream.mixer());
         let pcm_f32: Vec<f32> = samples
             .into_iter()
+            .skip(start_index)
             .map(|s| s as f32 / i16::MAX as f32)
             .collect();
 
@@ -4266,15 +4701,9 @@ impl TtsApp {
         Ok(())
     }
 
-    fn export_last_audio(&mut self) {
-        let Some(samples) = &self.last_audio_samples else {
-            self.status = "Ch?a c? audio ?? xu?t.".to_string();
-            return;
-        };
-
+    fn export_samples_to_wav(&self, samples: &[i16]) -> Result<PathBuf> {
         if let Err(err) = fs::create_dir_all(EXPORT_DIR) {
-            self.status = format!("Kh?ng tao duoc thu muc {}: {}", EXPORT_DIR, err);
-            return;
+            return Err(anyhow!("Kh?ng tao duoc thu muc {}: {}", EXPORT_DIR, err));
         }
 
         let ts = SystemTime::now()
@@ -4306,8 +4735,20 @@ impl TtsApp {
         })();
 
         match save_result {
-            Ok(()) => {
-                self.status = format!("?? xu?t audio: {}", output_path.display());
+            Ok(()) => Ok(output_path),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn export_last_audio(&mut self) {
+        let Some(samples) = &self.last_audio_samples else {
+            self.status = "Ch?a c? audio ?? xu?t.".to_string();
+            return;
+        };
+
+        match self.export_samples_to_wav(samples) {
+            Ok(path) => {
+                self.status = format!("?? xu?t audio: {}", path.display());
             }
             Err(err) => {
                 self.status = format!("Xu?t audio th?t b?i: {}", err);
@@ -4353,6 +4794,7 @@ impl TtsApp {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         self.is_fetching = false;
+                        self.auto_export_after_tts = false;
                         clear_receiver = true;
                         break;
                     }
@@ -4367,12 +4809,37 @@ impl TtsApp {
                 }
                 TtsEvent::Audio(samples) => {
                     self.is_fetching = false;
+                    let should_export = self.auto_export_after_tts;
+                    self.auto_export_after_tts = false;
+
+                    let mut export_note = None;
+                    if should_export {
+                        self.last_audio_samples = Some(samples.clone());
+                        match self.export_samples_to_wav(&samples) {
+                            Ok(path) => {
+                                export_note =
+                                    Some(format!("Exported WAV: {}", path.to_string_lossy()));
+                            }
+                            Err(err) => {
+                                export_note = Some(format!("Export failed: {}", err));
+                            }
+                        }
+                    }
+
                     match self.play_samples(samples) {
                         Ok(()) => {
-                            self.status = "?ang ph?t audio...".to_string();
+                            self.status = if let Some(note) = export_note {
+                                format!("{} | Playing audio...", note)
+                            } else {
+                                "?ang ph?t audio...".to_string()
+                            };
                         }
                         Err(err) => {
-                            self.status = format!("L?i ph?t audio: {}", err);
+                            self.status = if let Some(note) = export_note {
+                                format!("{} | Playback error: {}", note, err)
+                            } else {
+                                format!("L?i ph?t audio: {}", err)
+                            };
                             self.is_playing = false;
                         }
                     }
@@ -4381,6 +4848,7 @@ impl TtsApp {
                 TtsEvent::Error(err) => {
                     self.status = format!("L?i: {}", err);
                     self.is_fetching = false;
+                     self.auto_export_after_tts = false;
                     self.is_playing = false;
                     clear_receiver = true;
                 }
@@ -5068,6 +5536,9 @@ impl eframe::App for TtsApp {
         let mut cached_preview_clicked: Option<usize> = None;
         let mut speaker_edits: Vec<(usize, String)> = Vec::new();
         let mut text_edits: Vec<(usize, String)> = Vec::new();
+        let mut video_timing_edits: Vec<(usize, f64, f64)> = Vec::new();
+        let mut video_timing_preview_clicked: Option<usize> = None;
+        let mut video_timing_select_clicked: Option<usize> = None;
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let book_lines = parse_book_lines(&self.book_output);
         if self
@@ -5707,11 +6178,22 @@ impl eframe::App for TtsApp {
                             ui.label("The app keeps only the merged audiobook file.");
                         });
                         ui.add_space(8.0);
-                            ui.label("Parsed dialogue lines");
-                        egui::ScrollArea::vertical()
-                            .id_salt("book_lines_scroll")
-                            .max_height(280.0)
-                            .show(ui, |ui| {
+                        ui.label("Parsed dialogue lines");
+                        if let Some(path) = &self.dropped_audio_path {
+                            ui.label(format!(
+                                "Dropped external audio: {}",
+                                path.to_string_lossy()
+                            ));
+                        } else {
+                            ui.label("Tip: drag-and-drop an external audio file, then click 'Use dropped audio' on a line.");
+                        }
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_height(420.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("book_lines_scroll")
+                                .max_height(520.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
                                 if book_lines.is_empty() {
                                     ui.label("No dialogue lines available.");
                                 } else {
@@ -5720,6 +6202,10 @@ impl eframe::App for TtsApp {
                                             let selected = self.selected_book_line == Some(index);
                                             let mut line_gain = self.line_volume_percent(index);
                                             let mut speaker_name = line.speaker.clone();
+                                            let line_uses_gemini = self
+                                                .find_character_by_name(&line.speaker)
+                                                .map(|character| character.tts_engine == "gemini")
+                                                .unwrap_or(false);
                                             ui.horizontal_wrapped(|ui| {
                                                 let header = format!("{}.", index + 1);
                                                 if ui.selectable_label(selected, header).clicked() {
@@ -5737,6 +6223,24 @@ impl eframe::App for TtsApp {
                                                 }
                                                 if ui.button("Render line").clicked() {
                                                     self.start_render_book_line(index);
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        line_uses_gemini,
+                                                        egui::Button::new("Render split"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.start_render_book_line_split(index);
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        self.dropped_audio_path.is_some(),
+                                                        egui::Button::new("Use dropped audio"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.import_dropped_audio_to_line(index);
                                                 }
                                                 if self
                                                     .exported_speeches
@@ -5799,7 +6303,8 @@ impl eframe::App for TtsApp {
                                         ui.add_space(4.0);
                                     }
                                 }
-                            });
+                                });
+                        });
                     });
 
                 ui.add_space(10.0);
@@ -6194,6 +6699,19 @@ impl eframe::App for TtsApp {
                                 self.stop_audio();
                                 self.status = "Stopped.".to_string();
                             }
+                            if ui
+                                .add_enabled(
+                                    !self.is_fetching,
+                                    egui::Button::new(if self.is_fetching {
+                                        "Processing..."
+                                    } else {
+                                        "Render + Export WAV"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                self.start_speak_main_and_export();
+                            }
                             if ui.button("Export audio (WAV)").clicked() {
                                 self.export_last_audio();
                             }
@@ -6378,6 +6896,10 @@ impl eframe::App for TtsApp {
                         }
                     });
                     ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("video_export_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
                     ui.label(format!("Video status: {}", self.video_status));
                     let current_project_audio = if !self.last_audiobook_path.trim().is_empty() {
                         self.last_audiobook_path.trim().to_string()
@@ -6391,11 +6913,16 @@ impl eframe::App for TtsApp {
                         Some(normalize_project_root(Path::new(&self.last_export_dir)))
                     };
                     if let Some(root) = current_project_root {
-                        let gemini_audio = project_subtitle_dir(&root).join("audiobook_for_gemini.mp3");
+                        let source_name = match self.video_srt_provider {
+                            VideoSrtProvider::Gemini => "audiobook_for_gemini.mp3",
+                            VideoSrtProvider::GroqWhisper => "audiobook_for_groq.mp3",
+                        };
+                        let provider_audio = project_subtitle_dir(&root).join(source_name);
                         ui.label(format!(
-                            "Current SRT source audio: {}",
-                            if gemini_audio.exists() {
-                                gemini_audio.display().to_string()
+                            "Current SRT source audio ({}): {}",
+                            self.video_srt_provider.label(),
+                            if provider_audio.exists() {
+                                provider_audio.display().to_string()
                             } else {
                                 "(not created yet)".to_string()
                             }
@@ -6452,7 +6979,9 @@ impl eframe::App for TtsApp {
                                 .hint_text("Prologue / Chapter 1 / Epilogue"),
                         );
                         if tag_response.changed() {
-                            let _ = self.persist_state_to_disk();
+                            if let Err(err) = self.save_project_video_tag_snapshot() {
+                                self.video_status = format!("Could not save the project video tag: {}", err);
+                            }
                         }
                         ui.label("Tag font");
                         if ui
@@ -6500,6 +7029,9 @@ impl eframe::App for TtsApp {
                     });
                     if self.video_tag_position != old_tag_position {
                         let _ = self.persist_state_to_disk();
+                    }
+                    if self.video_corner_tag.trim().is_empty() {
+                        ui.label("Video tag is required for this project before preview/video export.");
                     }
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Font");
@@ -6644,35 +7176,78 @@ impl eframe::App for TtsApp {
                         }
                     });
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Highlight");
+                        ui.label("SRT provider");
                         if ui
                             .radio_value(
-                                &mut self.video_word_highlight_enabled,
-                                false,
-                                "Sentence",
-                            )
-                            .changed()
-                        {
-                            self.video_word_segments.clear();
-                            let _ = self.persist_state_to_disk();
-                        }
-                        if ui
-                            .radio_value(
-                                &mut self.video_word_highlight_enabled,
-                                true,
-                                "Word",
+                                &mut self.video_srt_provider,
+                                VideoSrtProvider::Gemini,
+                                "Gemini",
                             )
                             .changed()
                         {
                             let _ = self.persist_state_to_disk();
                         }
-                        ui.label(if self.video_word_highlight_enabled {
-                            "Word mode: Create SRT will call Gemini for an extra word-timing pass."
+                        if ui
+                            .radio_value(
+                                &mut self.video_srt_provider,
+                                VideoSrtProvider::GroqWhisper,
+                                "Groq (whisper-large-v3-turbo)",
+                            )
+                            .changed()
+                        {
+                            let _ = self.persist_state_to_disk();
+                        }
+                        ui.label("SRT mode: sentence only.");
+                    });
+                    if self.video_srt_provider == VideoSrtProvider::GroqWhisper {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Groq model");
+                            if ui
+                                .radio_value(
+                                    &mut self.groq_srt_model,
+                                    GroqSrtModel::WhisperLargeV3Turbo,
+                                    "whisper-large-v3-turbo",
+                                )
+                                .changed()
+                            {
+                                let _ = self.persist_state_to_disk();
+                            }
+                            if ui
+                                .radio_value(
+                                    &mut self.groq_srt_model,
+                                    GroqSrtModel::WhisperLargeV3,
+                                    "whisper-large-v3",
+                                )
+                                .changed()
+                            {
+                                let _ = self.persist_state_to_disk();
+                            }
+                        });
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Groq API key");
+                        let key_edit = ui.add_sized(
+                            [ui.available_width().min(360.0), 28.0],
+                            egui::TextEdit::singleline(&mut self.groq_api_key)
+                                .password(!self.show_groq_api_key)
+                                .hint_text("gsk_..."),
+                        );
+                        if key_edit.changed() {
+                            let _ = self.persist_state_to_disk();
+                        }
+                        if ui
+                            .button(if self.show_groq_api_key { "Hide" } else { "Show" })
+                            .clicked()
+                        {
+                            self.show_groq_api_key = !self.show_groq_api_key;
+                        }
+                        let key_loaded = !self.groq_api_key.trim().is_empty();
+                        ui.label(if key_loaded {
+                            "Groq key status: loaded"
                         } else {
-                            "Sentence mode: Create SRT uses sentence timing only, faster."
+                            "Groq key status: not loaded"
                         });
                     });
-
                     let preview_width = ui.available_width().min(820.0);
                     let preview_height = preview_width * 9.0 / 16.0;
                     let (preview_rect, _) = ui.allocate_exact_size(
@@ -6737,9 +7312,19 @@ impl eframe::App for TtsApp {
                             self.video_tag_font_size as f32,
                             video_preview_font_family(&self.video_font_name),
                         );
+                        let (tag_text_pos, tag_text_align) = match self.video_tag_position {
+                            VideoTagPosition::TopLeft => (
+                                egui::pos2(tag_rect.left() + 14.0, tag_rect.top() + 14.0),
+                                egui::Align2::LEFT_TOP,
+                            ),
+                            VideoTagPosition::TopCenter => (
+                                egui::pos2(preview_rect.center().x, tag_rect.top() + 14.0),
+                                egui::Align2::CENTER_TOP,
+                            ),
+                        };
                         painter.text(
-                            egui::pos2(tag_rect.left() + 14.0, tag_rect.top() + 14.0),
-                            egui::Align2::LEFT_TOP,
+                            tag_text_pos,
+                            tag_text_align,
                             self.video_corner_tag.trim(),
                             tag_font,
                             current_color,
@@ -7092,6 +7677,94 @@ impl eframe::App for TtsApp {
                             }
                         }
                     });
+                    if !self.video_timed_lines.is_empty() {
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new("Subtitle timing test")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.label("Use this panel to test one subtitle line at a time without covering the main preview.");
+                                if let Some(active) = self
+                                    .video_timed_lines
+                                    .get(self.current_video_preview_line_index())
+                                {
+                                    ui.label(format!(
+                                        "Current preview line {}: {}",
+                                        self.current_video_preview_line_index() + 1,
+                                        display_subtitle_text(&active.speaker, &active.text)
+                                    ));
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("Play selected line").clicked() {
+                                        let index = self
+                                            .selected_book_line
+                                            .unwrap_or_else(|| self.current_video_preview_line_index())
+                                            .min(self.video_timed_lines.len().saturating_sub(1));
+                                        video_timing_preview_clicked = Some(index);
+                                    }
+                                    if ui.button("Save timing to SRT").clicked() {
+                                        if let Err(err) = self.save_current_video_srt() {
+                                            self.video_status = err.to_string();
+                                        }
+                                    }
+                                });
+                                egui::ScrollArea::vertical()
+                                    .id_salt("video_timing_test_scroll")
+                                    .max_height(180.0)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        let timed_len = self.video_timed_lines.len();
+                                        for index in 0..timed_len {
+                                            let line = &self.video_timed_lines[index];
+                                            let mut start = line.start_seconds;
+                                            let mut end = line.end_seconds;
+                                            ui.group(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    let active = self.current_video_preview_line_index() == index;
+                                                    if ui
+                                                        .selectable_label(active, format!("{}.", index + 1))
+                                                        .clicked()
+                                                    {
+                                                        video_timing_select_clicked = Some(index);
+                                                    }
+                                                    if ui.button("Play").clicked() {
+                                                        video_timing_preview_clicked = Some(index);
+                                                    }
+                                                    ui.label(format!("{:.2}s", line.start_seconds));
+                                                    ui.label("->");
+                                                    ui.label(format!("{:.2}s", line.end_seconds));
+                                                });
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.label("Start");
+                                                    if ui
+                                                        .add(
+                                                            egui::DragValue::new(&mut start)
+                                                                .speed(0.05)
+                                                                .range(0.0..=9_999.0),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        video_timing_edits.push((index, start, end));
+                                                    }
+                                                    ui.label("End");
+                                                    if ui
+                                                        .add(
+                                                            egui::DragValue::new(&mut end)
+                                                                .speed(0.05)
+                                                                .range(0.0..=9_999.0),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        video_timing_edits.push((index, start, end));
+                                                    }
+                                                });
+                                                ui.label(display_subtitle_text(&line.speaker, &line.text));
+                                            });
+                                            ui.add_space(4.0);
+                                        }
+                                    });
+                            });
+                    }
+                        });
                 });
         }
 
@@ -7107,6 +7780,25 @@ impl eframe::App for TtsApp {
             self.set_book_line_speaker(index, &speaker);
         }
 
+        video_timing_edits.sort_by_key(|(index, _, _)| *index);
+        video_timing_edits.dedup_by(|a, b| a.0 == b.0);
+        let mut timing_changed = false;
+        for (index, mut start, mut end) in video_timing_edits {
+            if let Some(line) = self.video_timed_lines.get_mut(index) {
+                start = start.max(0.0);
+                end = end.max(start + 0.12);
+                line.start_seconds = start;
+                line.end_seconds = end;
+                timing_changed = true;
+            }
+        }
+        if timing_changed {
+            sanitize_timed_lines(&mut self.video_timed_lines);
+            if let Err(err) = self.save_current_video_srt() {
+                self.video_status = err.to_string();
+            }
+        }
+
         if let Some(voice) = preview_clicked {
             self.start_speak_preview(Some(voice));
         }
@@ -7115,6 +7807,12 @@ impl eframe::App for TtsApp {
         }
         if let Some(index) = cached_preview_clicked {
             self.play_cached_speech(index);
+        }
+        if let Some(index) = video_timing_select_clicked {
+            self.jump_to_video_timing_line(index, false);
+        }
+        if let Some(index) = video_timing_preview_clicked {
+            self.jump_to_video_timing_line(index, true);
         }
     }
 
@@ -7139,7 +7837,7 @@ fn run_tts_job(job: TtsJob, cancel_flag: Arc<AtomicBool>) -> Result<Vec<i16>> {
 }
 
 fn run_tts_job_with_chunking(job: &TtsJob) -> Result<Vec<i16>> {
-    let segments = split_tts_segments(&job.text);
+    let segments = split_gemini_tts_segments(&job.text);
     let mut all_samples = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
         let mut segment_job = job.clone();
@@ -7174,34 +7872,79 @@ fn run_tts_job_base_resilient(job: &TtsJob) -> Result<Vec<i16>> {
     match run_tts_job_with_chunking(job) {
         Ok(samples) => Ok(samples),
         Err(err) => {
-            let message = err.to_string();
+            let mut message = err.to_string();
+
             if should_retry_short_gemini_line(&job.text, &message) {
-                synthesize_short_gemini_line(job).map_err(|fallback_err| {
-                    anyhow!(
-                        "{} | short-line fallback that bai: {}",
-                        message,
-                        fallback_err
-                    )
-                })
-            } else if contains_dialogue_quotes(&job.text)
+                match synthesize_short_gemini_line(job) {
+                    Ok(samples) => return Ok(samples),
+                    Err(fallback_err) => {
+                        message =
+                            format!("{} | short-line fallback that bai: {}", message, fallback_err);
+                    }
+                }
+            }
+
+            if contains_dialogue_quotes(&job.text)
                 && message.to_lowercase().contains("khong tra ve audio")
             {
-                synthesize_quote_aware_gemini_line(job).map_err(|fallback_err| {
-                    anyhow!(
-                        "{} | quote-aware fallback that bai: {}",
-                        message,
-                        fallback_err
-                    )
-                })
-            } else {
-                Err(err)
+                match synthesize_quote_aware_gemini_line(job) {
+                    Ok(samples) => return Ok(samples),
+                    Err(fallback_err) => {
+                        message = format!(
+                            "{} | quote-aware fallback that bai: {}",
+                            message, fallback_err
+                        );
+                    }
+                }
             }
+
+            if should_retry_sensitive_word_sanitize(&job.text, &message) {
+                match synthesize_sensitive_word_sanitize_fallback(job) {
+                    Ok(samples) => return Ok(samples),
+                    Err(fallback_err) => {
+                        message = format!(
+                            "{} | sensitive-word fallback that bai: {}",
+                            message, fallback_err
+                        );
+                    }
+                }
+            }
+
+            Err(anyhow!(message))
         }
     }
 }
 
 fn run_tts_job_resilient(job: &TtsJob) -> Result<Vec<i16>> {
     run_tts_job_base_resilient(job)
+}
+
+fn gemini_audio_looks_truncated(text: &str, samples: &[i16]) -> bool {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return false;
+    }
+    let word_count = normalized.split_whitespace().count();
+    let char_count = normalized.chars().count();
+    if word_count < 45 && char_count < 260 {
+        return false;
+    }
+    let duration_seconds = samples.len() as f64 / SAMPLE_RATE as f64;
+    let minimum_reasonable_duration = ((word_count as f64) * 0.18)
+        .max((char_count as f64) * 0.018)
+        .max(6.5);
+    duration_seconds + 0.25 < minimum_reasonable_duration
+}
+
+fn run_gemini_line_with_split_guard(job: &TtsJob) -> Result<Vec<i16>> {
+    let samples = run_tts_job_resilient(job)?;
+    if gemini_audio_looks_truncated(&job.text, &samples) {
+        synthesize_split_gemini_line(job).with_context(|| {
+            "Gemini returned audio that looks truncated; split fallback failed".to_string()
+        })
+    } else {
+        Ok(samples)
+    }
 }
 
 fn should_retry_short_gemini_line(text: &str, error_message: &str) -> bool {
@@ -7768,6 +8511,9 @@ fn send_tts_setup(
             system_text.push(' ');
         }
     }
+    system_text.push_str(
+        "Use one consistent voice timbre and persona for the entire utterance. Do not switch to a second voice mid-sentence or after punctuation. ",
+    );
     system_text.push_str("Start reading immediately.");
 
     let setup = serde_json::json!({
@@ -8815,6 +9561,10 @@ fn project_text_dir(root: &Path) -> PathBuf {
     root.join("text")
 }
 
+fn project_video_tag_path(root: &Path) -> PathBuf {
+    project_text_dir(root).join("video_tag.txt")
+}
+
 fn project_audio_dir(root: &Path) -> PathBuf {
     root.join("audio")
 }
@@ -8911,6 +9661,22 @@ fn write_project_text_files(root: &Path, source_text: &str, formatted_text: &str
     Ok(())
 }
 
+fn write_project_video_tag(root: &Path, tag: &str) -> Result<()> {
+    ensure_project_structure(root)?;
+    fs::write(project_video_tag_path(root), tag)
+        .with_context(|| "Could not save the project video tag".to_string())?;
+    Ok(())
+}
+
+fn read_project_video_tag(root: &Path) -> Result<String> {
+    let path = project_video_tag_path(root);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    fs::read_to_string(&path)
+        .with_context(|| format!("Could not read {}", path.display()))
+}
+
 fn copy_background_to_project(root: &Path, background_path: Option<&Path>) -> Result<Option<PathBuf>> {
     let Some(path) = background_path else {
         return Ok(None);
@@ -8935,6 +9701,43 @@ fn copy_background_to_project(root: &Path, background_path: Option<&Path>) -> Re
         )
     })?;
     Ok(Some(destination))
+}
+
+fn prepare_background_for_video(
+    root: &Path,
+    background_path: Option<&Path>,
+    width: u32,
+    height: u32,
+) -> Result<Option<PathBuf>> {
+    let Some(copied_path) = copy_background_to_project(root, background_path)? else {
+        return Ok(None);
+    };
+
+    let prepared_path = project_image_dir(root).join(format!("background_{}x{}.png", width, height));
+    let source_meta = fs::metadata(&copied_path).ok();
+    let prepared_meta = fs::metadata(&prepared_path).ok();
+    let prepared_is_fresh = match (source_meta.as_ref(), prepared_meta.as_ref()) {
+        (Some(src), Some(dst)) => {
+            match (src.modified().ok(), dst.modified().ok()) {
+                (Some(src_time), Some(dst_time)) => dst_time >= src_time,
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if prepared_is_fresh {
+        return Ok(Some(prepared_path));
+    }
+
+    let image = ImageReader::open(&copied_path)
+        .with_context(|| format!("Khong mo duoc anh nen {}", copied_path.display()))?
+        .decode()
+        .with_context(|| format!("Khong doc duoc anh nen {}", copied_path.display()))?;
+    let prepared = image.resize_to_fill(width, height, FilterType::Lanczos3);
+    prepared
+        .save(&prepared_path)
+        .with_context(|| format!("Khong ghi duoc anh nen da chuan hoa {}", prepared_path.display()))?;
+    Ok(Some(prepared_path))
 }
 
 fn normalize_separators(path: &Path) -> String {
@@ -8985,6 +9788,41 @@ fn latest_srt_in_project(root: &Path) -> Option<PathBuf> {
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
     candidates.pop().map(|(_, path)| path)
+}
+
+fn clear_existing_subtitle_artifacts(root: &Path, provider: VideoSrtProvider) -> Result<()> {
+    let dir = project_subtitle_dir(root);
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let provider_audio_name = match provider {
+        VideoSrtProvider::Gemini => "audiobook_for_gemini.mp3",
+        VideoSrtProvider::GroqWhisper => "audiobook_for_groq.mp3",
+    };
+
+    for entry in fs::read_dir(&dir)
+        .with_context(|| format!("Could not read subtitle folder {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let should_remove = name == provider_audio_name
+            || name.ends_with(".srt")
+            || name.ends_with(".words.json")
+            || (name.starts_with("captions_") && name.ends_with(".ass"))
+            || (name.starts_with("preview_captions_") && name.ends_with(".ass"));
+        if should_remove {
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    Ok(())
 }
 
 fn list_available_project_dirs() -> Result<Vec<PathBuf>> {
@@ -9227,6 +10065,35 @@ struct GeminiWordTimingSegment {
     end_ms: u64,
 }
 
+#[derive(Deserialize)]
+struct GroqTranscriptionPayload {
+    #[serde(default)]
+    segments: Vec<GroqTranscriptionSegment>,
+    #[serde(default)]
+    words: Vec<GroqTranscriptionWord>,
+}
+
+#[derive(Deserialize, Clone)]
+struct GroqTranscriptionSegment {
+    start: f64,
+    end: f64,
+    text: String,
+}
+
+#[derive(Deserialize, Clone)]
+struct GroqTranscriptionWord {
+    word: String,
+    start: f64,
+    end: f64,
+}
+
+#[derive(Clone)]
+struct GroqAlignedWord {
+    normalized: String,
+    start: f64,
+    end: f64,
+}
+
 #[derive(Clone)]
 struct WordItem {
     line_index: usize,
@@ -9244,7 +10111,16 @@ fn collect_sentence_items(
     let timed_lines = build_timed_book_lines(lines, speeches, pause_ms)?;
     let mut items = Vec::new();
     for line in timed_lines {
-        let sentences = split_text_into_sentences(&line.text);
+        let sentences = if line.speaker.trim().eq_ignore_ascii_case("narrator") {
+            split_text_into_sentences(&line.text)
+        } else {
+            let trimmed = line.text.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            }
+        };
         if sentences.is_empty() {
             continue;
         }
@@ -9416,26 +10292,468 @@ fn compress_audio_for_gemini(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn analyze_sentence_timing_with_gemini(
+fn compress_audio_for_groq(input: &Path, output: &Path) -> Result<()> {
+    compress_audio_for_gemini(input, output)
+}
+
+fn build_multipart_form_data(
+    boundary: &str,
+    fields: &[(&str, &str)],
+    file_field_name: &str,
+    file_name: &str,
+    file_mime: &str,
+    file_bytes: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(file_bytes.len() + 4096);
+    for (name, value) in fields {
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+            file_field_name, file_name
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {}\r\n\r\n", file_mime).as_bytes());
+    body.extend_from_slice(file_bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+    body
+}
+
+fn request_groq_transcription(
+    api_key: &str,
+    audio_path: &Path,
+    model: GroqSrtModel,
+) -> Result<GroqTranscriptionPayload> {
+    let file_bytes = fs::read(audio_path)
+        .with_context(|| format!("Could not read audio for Groq: {}", audio_path.display()))?;
+    if file_bytes.is_empty() {
+        return Err(anyhow!("Audio for Groq transcription is empty."));
+    }
+    let file_mime = infer_audio_mime_type(audio_path).unwrap_or("audio/mpeg");
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let boundary = format!("----InstantNarratorGroq{}", millis);
+    let form = build_multipart_form_data(
+        &boundary,
+        &[
+            ("model", model.api_name()),
+            ("response_format", "verbose_json"),
+            ("temperature", "0"),
+            ("timestamp_granularities[]", "segment"),
+            ("timestamp_granularities[]", "word"),
+        ],
+        "file",
+        "audiobook.mp3",
+        file_mime,
+        &file_bytes,
+    );
+    let response = ureq::post(GROQ_TRANSCRIBE_URL)
+        .header("Authorization", &format!("Bearer {}", api_key))
+        .header(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={}", boundary),
+        )
+        .send(form.as_slice())
+        .map_err(|err| anyhow!("Could not call Groq for SRT generation: {}", err))?;
+    let raw = response
+        .into_body()
+        .read_to_string()
+        .map_err(|err| anyhow!("Could not read Groq response body: {}", err))?;
+    serde_json::from_str::<GroqTranscriptionPayload>(&raw)
+        .map_err(|err| anyhow!("Invalid Groq transcription JSON: {}", err))
+}
+
+fn normalize_alignment_token(input: &str) -> String {
+    normalize_gemini_tts_text(input)
+        .to_lowercase()
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || *ch == '\'')
+        .collect::<String>()
+}
+
+fn collect_alignment_tokens(text: &str) -> Vec<String> {
+    split_text_into_words(text)
+        .into_iter()
+        .map(|word| normalize_alignment_token(&word))
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn lcs_length(left: &[String], right: &[String]) -> usize {
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    let mut previous = vec![0usize; right.len() + 1];
+    let mut current = vec![0usize; right.len() + 1];
+    for left_token in left {
+        for (j, right_token) in right.iter().enumerate() {
+            current[j + 1] = if left_token == right_token {
+                previous[j] + 1
+            } else {
+                previous[j + 1].max(current[j])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+        current.fill(0);
+    }
+    previous[right.len()]
+}
+
+fn groq_aligned_words(words: &[GroqTranscriptionWord]) -> Vec<GroqAlignedWord> {
+    words.iter()
+        .filter_map(|word| {
+            let normalized = normalize_alignment_token(&word.word);
+            if normalized.is_empty() || word.end <= word.start {
+                None
+            } else {
+                Some(GroqAlignedWord {
+                    normalized,
+                    start: word.start.max(0.0),
+                    end: word.end.max(word.start + 0.02),
+                })
+            }
+        })
+        .collect()
+}
+
+fn best_groq_sentence_window(
+    words: &[GroqAlignedWord],
+    cursor: usize,
+    expected_tokens: &[String],
+) -> Option<(usize, usize, f64)> {
+    if words.is_empty() || expected_tokens.is_empty() || cursor >= words.len() {
+        return None;
+    }
+
+    let expected_len = expected_tokens.len();
+    let min_window = expected_len.saturating_mul(2) / 3;
+    let min_window = min_window.max(1);
+    let max_window = (expected_len.saturating_mul(8) / 5).max(min_window) + 6;
+    let max_start = (cursor + 4).min(words.len().saturating_sub(1));
+
+    let mut best: Option<(usize, usize, f64, usize)> = None;
+    for start in cursor..=max_start {
+        for window_len in min_window..=max_window {
+            let end = start + window_len - 1;
+            if end >= words.len() {
+                break;
+            }
+            let candidate_tokens = words[start..=end]
+                .iter()
+                .map(|word| word.normalized.clone())
+                .collect::<Vec<_>>();
+            let lcs = lcs_length(expected_tokens, &candidate_tokens);
+            if lcs == 0 {
+                continue;
+            }
+            let overlap_score =
+                (2.0 * lcs as f64) / (expected_tokens.len() as f64 + candidate_tokens.len() as f64);
+            let length_penalty = ((candidate_tokens.len() as isize - expected_tokens.len() as isize)
+                .unsigned_abs() as f64)
+                * 0.015;
+            let score = overlap_score - length_penalty;
+            let diff = candidate_tokens.len().abs_diff(expected_tokens.len());
+            match best {
+                Some((_, _, best_score, best_diff))
+                    if score < best_score || ((score - best_score).abs() < 0.0001 && diff >= best_diff) => {}
+                _ => best = Some((start, end, score, diff)),
+            }
+        }
+    }
+
+    best.map(|(start, end, score, _)| (start, end, score))
+}
+
+fn min_required_groq_token_matches(expected_len: usize) -> usize {
+    match expected_len {
+        0 => 0,
+        1..=3 => expected_len,
+        4..=6 => expected_len.saturating_sub(1),
+        _ => ((expected_len as f64) * 0.6).ceil() as usize,
+    }
+}
+
+fn find_sequential_token_matches(
+    words: &[GroqAlignedWord],
+    cursor: usize,
+    expected_tokens: &[String],
+) -> Option<Vec<usize>> {
+    if words.is_empty() || expected_tokens.is_empty() || cursor >= words.len() {
+        return None;
+    }
+
+    let max_lookahead = (expected_tokens.len() * 4 + 18).max(24);
+    let mut matches = Vec::new();
+    let mut search_cursor = cursor;
+
+    for token in expected_tokens {
+        let search_end = (search_cursor + max_lookahead).min(words.len());
+        let mut found = None;
+        for idx in search_cursor..search_end {
+            if words[idx].normalized == *token {
+                found = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = found {
+            matches.push(idx);
+            search_cursor = idx + 1;
+        }
+    }
+
+    let min_required = min_required_groq_token_matches(expected_tokens.len());
+    (matches.len() >= min_required).then_some(matches)
+}
+
+fn map_groq_segments_to_sentence_timing(
+    segments: &[GroqTranscriptionSegment],
+    words: &[GroqTranscriptionWord],
+    sentence_items: &[SentenceItem],
+) -> Result<Vec<TimedBookLine>> {
+    if sentence_items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let aligned_words = groq_aligned_words(words);
+    if !aligned_words.is_empty() {
+        let mut out = Vec::with_capacity(sentence_items.len());
+        let mut cursor = 0usize;
+        let mut previous_end = aligned_words
+            .first()
+            .map(|word| word.start)
+            .unwrap_or(0.0)
+            .max(0.0);
+
+        for item in sentence_items {
+            let expected_tokens = collect_alignment_tokens(&item.text);
+            if expected_tokens.is_empty() {
+                out.push(TimedBookLine {
+                    speaker: item.speaker.clone(),
+                    text: item.text.clone(),
+                    start_seconds: previous_end,
+                    end_seconds: (previous_end + 0.12).max(item.fallback_end_seconds),
+                });
+                previous_end = out.last().map(|line| line.end_seconds).unwrap_or(previous_end);
+                continue;
+            }
+
+            let strict_matches = find_sequential_token_matches(&aligned_words, cursor, &expected_tokens);
+            let (mut start_seconds, mut end_seconds, next_cursor) = if let Some(matches) = strict_matches {
+                let start_idx = *matches.first().unwrap_or(&cursor);
+                let end_idx = *matches.last().unwrap_or(&start_idx);
+                (
+                    aligned_words[start_idx].start,
+                    aligned_words[end_idx].end,
+                    end_idx + 1,
+                )
+            } else {
+                let chosen = best_groq_sentence_window(&aligned_words, cursor, &expected_tokens);
+                if let Some((start_idx, end_idx, score)) = chosen {
+                    if score >= 0.42 {
+                        (
+                            aligned_words[start_idx].start,
+                            aligned_words[end_idx].end,
+                            end_idx + 1,
+                        )
+                    } else {
+                        (
+                            item.fallback_start_seconds,
+                            item.fallback_end_seconds,
+                            cursor,
+                        )
+                    }
+                } else {
+                    (
+                        item.fallback_start_seconds,
+                        item.fallback_end_seconds,
+                        cursor,
+                    )
+                }
+            };
+
+            if start_seconds < previous_end {
+                start_seconds = previous_end;
+            }
+            end_seconds = end_seconds.max(start_seconds + 0.12);
+            out.push(TimedBookLine {
+                speaker: item.speaker.clone(),
+                text: item.text.clone(),
+                start_seconds,
+                end_seconds,
+            });
+            previous_end = end_seconds;
+            cursor = next_cursor.min(aligned_words.len());
+        }
+
+        sanitize_timed_lines(&mut out);
+        return Ok(out);
+    }
+
+    if segments.is_empty() {
+        let mut fallback = sentence_items
+            .iter()
+            .map(|item| TimedBookLine {
+                speaker: item.speaker.clone(),
+                text: item.text.clone(),
+                start_seconds: item.fallback_start_seconds,
+                end_seconds: item.fallback_end_seconds,
+            })
+            .collect::<Vec<_>>();
+        sanitize_timed_lines(&mut fallback);
+        return Ok(fallback);
+    }
+
+    let mut filtered_segments = segments
+        .iter()
+        .filter(|segment| segment.end > segment.start)
+        .cloned()
+        .collect::<Vec<_>>();
+    if filtered_segments.is_empty() {
+        return Err(anyhow!("Groq returned segments but no valid time ranges."));
+    }
+
+    filtered_segments.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut segment_units = Vec::with_capacity(filtered_segments.len());
+    for segment in &filtered_segments {
+        let units = split_text_into_words(&segment.text).len().max(1) as f64;
+        segment_units.push(units);
+    }
+    let total_segment_units = segment_units.iter().sum::<f64>().max(1.0);
+    let total_sentence_units = sentence_items
+        .iter()
+        .map(|item| split_text_into_words(&item.text).len().max(1) as f64)
+        .sum::<f64>()
+        .max(1.0);
+
+    let mut cumulative_segment_units = Vec::with_capacity(segment_units.len());
+    let mut running_segment_units = 0.0f64;
+    for units in &segment_units {
+        running_segment_units += *units;
+        cumulative_segment_units.push(running_segment_units);
+    }
+
+    let time_for_unit = |target: f64| -> f64 {
+        let target = target.clamp(0.0, total_segment_units);
+        let mut previous_cumulative = 0.0f64;
+        for (idx, segment) in filtered_segments.iter().enumerate() {
+            let current_cumulative = cumulative_segment_units[idx];
+            if target <= current_cumulative || idx + 1 == filtered_segments.len() {
+                let unit_span = (current_cumulative - previous_cumulative).max(1e-6);
+                let local_ratio = ((target - previous_cumulative) / unit_span).clamp(0.0, 1.0);
+                let segment_span = (segment.end - segment.start).max(0.05);
+                return segment.start + segment_span * local_ratio;
+            }
+            previous_cumulative = current_cumulative;
+        }
+        filtered_segments
+            .last()
+            .map(|segment| segment.end)
+            .unwrap_or(0.0)
+    };
+
+    let mut out = Vec::with_capacity(sentence_items.len());
+    let mut consumed_sentence_units = 0.0f64;
+    let mut previous_end = filtered_segments
+        .first()
+        .map(|segment| segment.start)
+        .unwrap_or(0.0)
+        .max(0.0);
+
+    for item in sentence_items {
+        let sentence_units = split_text_into_words(&item.text).len().max(1) as f64;
+        let start_ratio = consumed_sentence_units / total_sentence_units;
+        consumed_sentence_units += sentence_units;
+        let end_ratio = consumed_sentence_units / total_sentence_units;
+
+        let target_start_unit = total_segment_units * start_ratio;
+        let target_end_unit = total_segment_units * end_ratio;
+        let mut start_seconds = time_for_unit(target_start_unit).max(0.0);
+        let mut end_seconds = time_for_unit(target_end_unit).max(start_seconds + 0.12);
+        if start_seconds < previous_end {
+            start_seconds = previous_end;
+            end_seconds = end_seconds.max(start_seconds + 0.12);
+        }
+        out.push(TimedBookLine {
+            speaker: item.speaker.clone(),
+            text: item.text.clone(),
+            start_seconds,
+            end_seconds,
+        });
+        previous_end = end_seconds;
+    }
+
+    sanitize_timed_lines(&mut out);
+    Ok(out)
+}
+
+fn analyze_sentence_timing_with_groq(
     api_key: &str,
     audio_path: &Path,
     sentence_items: &[SentenceItem],
+    model: GroqSrtModel,
 ) -> Result<Vec<TimedBookLine>> {
-    let mime_type = infer_audio_mime_type(audio_path)
-        .ok_or_else(|| anyhow!("Dinh ?ang audio nen khong duoc Gemini ho tro."))?;
-    let bytes = fs::read(audio_path)
-        .with_context(|| format!("Kh?ng doc duoc audio {}", audio_path.display()))?;
-    if bytes.len() > MAX_INLINE_AUDIO_BYTES {
-        return Err(anyhow!(
-            "Audio cho Gemini van qua lon sau khi nen: {} MB",
-            bytes.len() / (1024 * 1024)
-        ));
-    }
+    let transcription = request_groq_transcription(api_key, audio_path, model)?;
+    map_groq_segments_to_sentence_timing(
+        &transcription.segments,
+        &transcription.words,
+        sentence_items,
+    )
+}
 
+fn gemini_sentence_batches(sentence_items: &[SentenceItem]) -> Vec<(usize, usize)> {
+    const MAX_BATCH_SENTENCES: usize = 40;
+    const MAX_BATCH_CHARS: usize = 2_400;
+
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    while start < sentence_items.len() {
+        let mut end = start;
+        let mut total_chars = 0usize;
+        while end < sentence_items.len() {
+            let next_chars = sentence_items[end].text.len().max(1);
+            let next_count = end - start + 1;
+            if end > start
+                && (next_count > MAX_BATCH_SENTENCES
+                    || total_chars.saturating_add(next_chars) > MAX_BATCH_CHARS)
+            {
+                break;
+            }
+            total_chars = total_chars.saturating_add(next_chars);
+            end += 1;
+        }
+        batches.push((start, end));
+        start = end;
+    }
+    batches
+}
+
+fn request_gemini_sentence_timing_batch(
+    api_key: &str,
+    mime_type: &str,
+    audio_b64: &str,
+    batch_start_index: usize,
+    sentence_items: &[SentenceItem],
+) -> Result<Vec<GeminiSubtitleSegment>> {
     let sentence_list = sentence_items
         .iter()
         .enumerate()
-        .map(|(idx, item)| format!("{}. {}", idx + 1, item.text))
+        .map(|(idx, item)| format!("{}. {}", batch_start_index + idx + 1, item.text))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -9444,14 +10762,14 @@ fn analyze_sentence_timing_with_gemini(
             "parts": [
                 {
                     "text": format!(
-                        "You are aligning subtitle timing for an audiobook. The audio matches the provided sentence list exactly and in the same order. Return valid JSON only with this shape: {{\"segments\":[{{\"sentence_index\":1,\"start_ms\":0,\"end_ms\":1200}}]}}. Rules: use every sentence exactly once; preserve order; do not rewrite text; start_ms/end_ms are integers in milliseconds; end_ms must be greater than start_ms; segments must be monotonic and must cover the whole spoken audio. Sentence list:\n{}",
+                        "You are aligning subtitle timing for an audiobook. The audio is the full audiobook. The sentence list below is a contiguous subset of that audiobook and appears exactly once in the same order. Return valid JSON only with this shape: {{\"segments\":[{{\"sentence_index\":1,\"start_ms\":0,\"end_ms\":1200}}]}}. Rules: use every listed sentence exactly once; preserve order; do not rewrite text; use the exact sentence_index values provided in the list below; start_ms/end_ms are integers in milliseconds on the full audio timeline; end_ms must be greater than start_ms; segments must be monotonic. Sentence list:\n{}",
                         sentence_list
                     )
                 },
                 {
                     "inline_data": {
                         "mime_type": mime_type,
-                        "data": general_purpose::STANDARD.encode(bytes),
+                        "data": audio_b64,
                     }
                 }
             ]
@@ -9470,50 +10788,449 @@ fn analyze_sentence_timing_with_gemini(
     let response = ureq::post(&url)
         .content_type("application/json")
         .send(&payload.to_string())
-        .map_err(|err| anyhow!("Kh?ng goi duoc Gemini de tao SRT: {}", err))?;
+        .map_err(|err| {
+            anyhow!(
+                "Khong goi duoc Gemini de tao SRT batch {}-{}: {}",
+                batch_start_index + 1,
+                batch_start_index + sentence_items.len(),
+                err
+            )
+        })?;
     let body = response
         .into_body()
         .read_to_string()
-        .map_err(|err| anyhow!("Kh?ng doc duoc phan hoi Gemini SRT: {}", err))?;
-    let json: Value =
-        serde_json::from_str(&body).map_err(|err| anyhow!("JSON Gemini SRT khong hop le: {}", err))?;
-    let raw_text = extract_candidate_text(&json)
-        .ok_or_else(|| anyhow!("Gemini khong tra ve SRT timing hop le."))?;
-    let parsed: GeminiSubtitlePayload = serde_json::from_str(&raw_text)
-        .map_err(|err| anyhow!("JSON segment timing khong hop le: {}", err))?;
+        .map_err(|err| {
+            anyhow!(
+                "Khong doc duoc phan hoi Gemini SRT batch {}-{}: {}",
+                batch_start_index + 1,
+                batch_start_index + sentence_items.len(),
+                err
+            )
+        })?;
+    let json: Value = serde_json::from_str(&body)
+        .map_err(|err| anyhow!("JSON Gemini SRT khong hop le: {}", err))?;
+    let raw_text = extract_candidate_text(&json).ok_or_else(|| {
+        anyhow!(
+            "Gemini khong tra ve SRT timing hop le cho batch {}-{}.",
+            batch_start_index + 1,
+            batch_start_index + sentence_items.len()
+        )
+    })?;
+    let parsed: GeminiSubtitlePayload = serde_json::from_str(&raw_text).map_err(|err| {
+        anyhow!(
+            "JSON segment timing khong hop le cho batch {}-{}: {}",
+            batch_start_index + 1,
+            batch_start_index + sentence_items.len(),
+            err
+        )
+    })?;
 
     if parsed.segments.len() != sentence_items.len() {
         return Err(anyhow!(
-            "Sentence timing mismatch: Gemini returned {} segments for {} sentences. One sentence was likely merged, skipped, or split differently.",
+            "Sentence timing mismatch in Gemini batch {}-{}: got {} segments for {} sentences.",
+            batch_start_index + 1,
+            batch_start_index + sentence_items.len(),
             parsed.segments.len(),
             sentence_items.len()
         ));
     }
 
-    let mut out = Vec::with_capacity(sentence_items.len());
-    for (idx, item) in sentence_items.iter().enumerate() {
-        let segment = &parsed.segments[idx];
-        if segment.sentence_index != idx + 1 {
-            return Err(anyhow!(
-                "Gemini tra sai thu tu subtitle o cau {}.",
-                idx + 1
-            ));
+    Ok(parsed.segments)
+}
+
+fn request_gemini_single_sentence_timing(
+    api_key: &str,
+    mime_type: &str,
+    audio_b64: &str,
+    batch_start_index: usize,
+    sentence_item: &SentenceItem,
+) -> Result<Vec<GeminiSubtitleSegment>> {
+    let payload = serde_json::json!({
+        "contents": [{
+            "parts": [
+                {
+                    "text": format!(
+                        "You are aligning subtitle timing for exactly one sentence in a full audiobook. Return valid JSON only with this shape: {{\"sentence_index\":{},\"start_ms\":0,\"end_ms\":1200}}. Rules: return exactly one object; do not return an array; do not split the sentence; do not include any other sentence; use the same sentence_index shown here; start_ms/end_ms are integers in milliseconds on the full audio timeline; end_ms must be greater than start_ms. Sentence {}: {}",
+                        batch_start_index + 1,
+                        batch_start_index + 1,
+                        sentence_item.text
+                    )
+                },
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": audio_b64,
+                    }
+                }
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json"
+        }
+    });
+
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        ANALYSIS_MODEL, api_key
+    );
+
+    let response = ureq::post(&url)
+        .content_type("application/json")
+        .send(&payload.to_string())
+        .map_err(|err| {
+            anyhow!(
+                "Khong goi duoc Gemini de tao SRT sentence {}: {}",
+                batch_start_index + 1,
+                err
+            )
+        })?;
+    let body = response
+        .into_body()
+        .read_to_string()
+        .map_err(|err| {
+            anyhow!(
+                "Khong doc duoc phan hoi Gemini SRT sentence {}: {}",
+                batch_start_index + 1,
+                err
+            )
+        })?;
+    let json: Value = serde_json::from_str(&body)
+        .map_err(|err| anyhow!("JSON Gemini SRT khong hop le: {}", err))?;
+    let raw_text = extract_candidate_text(&json).ok_or_else(|| {
+        anyhow!(
+            "Gemini khong tra ve SRT timing hop le cho sentence {}.",
+            batch_start_index + 1
+        )
+    })?;
+    let parsed: GeminiSubtitleSegment = serde_json::from_str(&raw_text).map_err(|err| {
+        anyhow!(
+            "JSON single sentence timing khong hop le cho sentence {}: {}",
+            batch_start_index + 1,
+            err
+        )
+    })?;
+
+    if parsed.end_ms <= parsed.start_ms {
+        return Err(anyhow!(
+            "Gemini returned invalid timing for sentence {}.",
+            batch_start_index + 1
+        ));
+    }
+
+    Ok(vec![GeminiSubtitleSegment {
+        sentence_index: batch_start_index + 1,
+        start_ms: parsed.start_ms,
+        end_ms: parsed.end_ms,
+    }])
+}
+
+fn request_gemini_sentence_timing_batch_recursive(
+    api_key: &str,
+    mime_type: &str,
+    audio_b64: &str,
+    batch_start_index: usize,
+    sentence_items: &[SentenceItem],
+) -> Result<Vec<GeminiSubtitleSegment>> {
+    match request_gemini_sentence_timing_batch(
+        api_key,
+        mime_type,
+        audio_b64,
+        batch_start_index,
+        sentence_items,
+    ) {
+        Ok(segments) if segments.len() == sentence_items.len() => Ok(segments),
+        Ok(_) | Err(_) if sentence_items.len() == 1 => request_gemini_single_sentence_timing(
+            api_key,
+            mime_type,
+            audio_b64,
+            batch_start_index,
+            &sentence_items[0],
+        ),
+        Ok(_) | Err(_) => {
+            let mid = sentence_items.len() / 2;
+            if mid == 0 {
+                return Err(anyhow!(
+                    "Gemini timing failed for sentence {}.",
+                    batch_start_index + 1
+                ));
+            }
+            let mut left = request_gemini_sentence_timing_batch_recursive(
+                api_key,
+                mime_type,
+                audio_b64,
+                batch_start_index,
+                &sentence_items[..mid],
+            )?;
+            let mut right = request_gemini_sentence_timing_batch_recursive(
+                api_key,
+                mime_type,
+                audio_b64,
+                batch_start_index + mid,
+                &sentence_items[mid..],
+            )?;
+            left.append(&mut right);
+            Ok(left)
+        }
+    }
+}
+
+fn analyze_sentence_timing_with_gemini(
+    api_key: &str,
+    audio_path: &Path,
+    sentence_items: &[SentenceItem],
+) -> Result<Vec<TimedBookLine>> {
+    let mime_type = infer_audio_mime_type(audio_path)
+        .ok_or_else(|| anyhow!("Dinh ?ang audio nen khong duoc Gemini ho tro."))?;
+    let bytes = fs::read(audio_path)
+        .with_context(|| format!("Kh?ng doc duoc audio {}", audio_path.display()))?;
+    if bytes.len() > MAX_INLINE_AUDIO_BYTES {
+        return Err(anyhow!(
+            "Audio cho Gemini van qua lon sau khi nen: {} MB",
+            bytes.len() / (1024 * 1024)
+        ));
+    }
+    let audio_b64 = general_purpose::STANDARD.encode(bytes);
+    let parsed_segments = request_gemini_sentence_timing_batch(
+        api_key,
+        mime_type,
+        &audio_b64,
+        0,
+        sentence_items,
+    )?;
+
+    if parsed_segments.len() != sentence_items.len() {
+        return Err(anyhow!(
+            "Sentence timing mismatch: Gemini returned {} segments for {} sentences. Video export is blocked to avoid subtitle drift.",
+            parsed_segments.len(),
+            sentence_items.len()
+        ));
+    }
+
+    let mut segment_by_index = vec![None::<(f64, f64)>; sentence_items.len()];
+    for segment in &parsed_segments {
+        if segment.sentence_index == 0 || segment.sentence_index > sentence_items.len() {
+            continue;
+        }
+        let slot = &mut segment_by_index[segment.sentence_index - 1];
+        if slot.is_some() {
+            continue;
         }
         let start_seconds = segment.start_ms as f64 / 1000.0;
-        let mut end_seconds = segment.end_ms as f64 / 1000.0;
-        if end_seconds <= start_seconds {
+        let end_seconds = segment.end_ms as f64 / 1000.0;
+        *slot = Some((start_seconds, end_seconds));
+    }
+
+    let missing = segment_by_index
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, value)| value.is_none().then_some(idx + 1))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let preview = missing
+            .iter()
+            .take(8)
+            .map(|idx| idx.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow!(
+            "Sentence timing mismatch: missing timing for sentence index(es): {}{}",
+            preview,
+            if missing.len() > 8 { ", ..." } else { "" }
+        ));
+    }
+
+    let mut out = Vec::with_capacity(sentence_items.len());
+    let mut prev_end_seconds = 0.0f64;
+    for (idx, item) in sentence_items.iter().enumerate() {
+        let (raw_start, raw_end, has_gemini_timing) = match segment_by_index[idx] {
+            Some((start, end)) => (start, end, true),
+            None => (
+                item.fallback_start_seconds,
+                item.fallback_end_seconds,
+                false,
+            ),
+        };
+
+        let mut start_seconds = raw_start.max(0.0);
+        if start_seconds < prev_end_seconds {
+            start_seconds = prev_end_seconds;
+        }
+
+        let mut end_seconds = raw_end.max(start_seconds + 0.12);
+        if !has_gemini_timing && end_seconds <= start_seconds {
             end_seconds = item.fallback_end_seconds.max(start_seconds + 0.12);
         }
+
         out.push(TimedBookLine {
             speaker: item.speaker.clone(),
             text: item.text.clone(),
             start_seconds,
             end_seconds,
         });
+        prev_end_seconds = end_seconds;
     }
 
     sanitize_timed_lines(&mut out);
+    let fallback = fallback_timed_lines_from_sentence_items(sentence_items);
+    let fallback_total = fallback
+        .last()
+        .map(|line| line.end_seconds)
+        .unwrap_or(0.0);
+    let reference_total = audio_duration_seconds(audio_path)
+        .ok()
+        .filter(|seconds| *seconds > 0.0)
+        .unwrap_or(fallback_total);
+    if should_use_fallback_timing(&out, reference_total, fallback_total) {
+        eprintln!(
+            "Gemini sentence timing drifted too far from audio (gemini={:.2}s, audio={:.2}s, fallback={:.2}s). Using fallback timing.",
+            out.last().map(|line| line.end_seconds).unwrap_or(0.0),
+            reference_total,
+            fallback_total
+        );
+        return Ok(fallback);
+    }
     Ok(out)
+}
+
+fn fallback_timed_lines_from_sentence_items(sentence_items: &[SentenceItem]) -> Vec<TimedBookLine> {
+    let mut fallback = sentence_items
+        .iter()
+        .map(|item| TimedBookLine {
+            speaker: item.speaker.clone(),
+            text: item.text.clone(),
+            start_seconds: item.fallback_start_seconds,
+            end_seconds: item.fallback_end_seconds,
+        })
+        .collect::<Vec<_>>();
+    sanitize_timed_lines(&mut fallback);
+    fallback
+}
+
+fn audio_duration_seconds(path: &Path) -> Result<f64> {
+    let samples = read_audio_samples_any(path)?;
+    Ok(samples.len() as f64 / SAMPLE_RATE as f64)
+}
+
+fn should_use_fallback_timing(
+    gemini_lines: &[TimedBookLine],
+    audio_duration_seconds: f64,
+    fallback_total_seconds: f64,
+) -> bool {
+    let gemini_total = gemini_lines
+        .last()
+        .map(|line| line.end_seconds)
+        .unwrap_or(0.0);
+    if gemini_total <= 0.0 {
+        return true;
+    }
+
+    let reference_total = audio_duration_seconds.max(fallback_total_seconds);
+    if reference_total <= 0.0 {
+        return false;
+    }
+
+    let allowed_drift = (reference_total * 0.08).max(2.5);
+    (gemini_total - reference_total).abs() > allowed_drift
+}
+
+fn split_gemini_tts_segments(input: &str) -> Vec<String> {
+    let normalized = normalize_gemini_tts_text(input)
+        .replace("\r\n", "\n")
+        .replace('\n', " ");
+    let compact = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return Vec::new();
+    }
+    // User-requested behavior: always send one full segment to Gemini Live.
+    vec![compact]
+}
+
+fn should_retry_sensitive_word_sanitize(text: &str, error_message: &str) -> bool {
+    let lowered = error_message.to_lowercase();
+    if !lowered.contains("khong tra ve audio") {
+        return false;
+    }
+    sanitize_sensitive_words_for_gemini_retry(text).is_some()
+}
+
+fn synthesize_sensitive_word_sanitize_fallback(job: &TtsJob) -> Result<Vec<i16>> {
+    let Some(sanitized_text) = sanitize_sensitive_words_for_gemini_retry(&job.text) else {
+        return Err(anyhow!("Khong co tu nhay cam nao de sanitize."));
+    };
+
+    let mut retry_job = job.clone();
+    retry_job.text = sanitized_text;
+
+    if retry_job.style_instruction.trim().is_empty() {
+        retry_job.style_instruction =
+            "Read naturally and keep the same pacing and emotion.".to_string();
+    } else {
+        retry_job.style_instruction = format!(
+            "{} {}",
+            retry_job.style_instruction.trim(),
+            "Read naturally and keep the same pacing and emotion."
+        );
+    }
+
+    run_tts_job_with_chunking(&retry_job)
+}
+
+fn sanitize_sensitive_words_for_gemini_retry(text: &str) -> Option<String> {
+    let (step1, changed1) = replace_ascii_word_case_insensitive(text, "cock", "coc");
+    let (step2, changed2) = replace_ascii_word_case_insensitive(&step1, "dildo", "dil-do");
+    if changed1 || changed2 {
+        Some(step2)
+    } else {
+        None
+    }
+}
+
+fn replace_ascii_word_case_insensitive(input: &str, word: &str, replacement: &str) -> (String, bool) {
+    if input.is_empty() || word.is_empty() {
+        return (input.to_string(), false);
+    }
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut last = 0usize;
+    let mut changed = false;
+
+    for (start, _) in input.char_indices() {
+        if start < last {
+            continue;
+        }
+        let end = start.saturating_add(word.len());
+        if end > input.len() {
+            break;
+        }
+        let Some(slice) = input.get(start..end) else {
+            continue;
+        };
+        if !slice.eq_ignore_ascii_case(word) {
+            continue;
+        }
+
+        let left_ok = start == 0 || !is_ascii_word_byte(bytes[start - 1]);
+        let right_ok = end == input.len() || !is_ascii_word_byte(bytes[end]);
+        if !left_ok || !right_ok {
+            continue;
+        }
+
+        out.push_str(&input[last..start]);
+        out.push_str(replacement);
+        last = end;
+        changed = true;
+    }
+
+    if !changed {
+        return (input.to_string(), false);
+    }
+    out.push_str(&input[last..]);
+    (out, true)
+}
+
+fn is_ascii_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 fn sanitize_timed_lines(lines: &mut [TimedBookLine]) {
@@ -9593,7 +11310,6 @@ fn build_video_srt_with_gemini(
     audiobook_path: &Path,
     output_dir: &Path,
     pause_ms: u32,
-    enable_word_highlight: bool,
     subtitle_lead_seconds: f64,
     cancel_flag: &AtomicBool,
     progress_tx: Sender<VideoEvent>,
@@ -9622,36 +11338,16 @@ fn build_video_srt_with_gemini(
     )?;
     ensure_not_cancelled(cancel_flag, "Video export cancelled.")?;
     apply_subtitle_lead_to_lines(&mut timed_lines, subtitle_lead_seconds);
-    let mut word_segments = if enable_word_highlight {
-        let _ = progress_tx.send(VideoEvent::Progress {
-            fraction: 0.23,
-            label: "?ang d?ng Gemini t?o word timing...".to_string(),
-        });
-        let word_items = collect_word_items(&timed_lines);
-        let segments =
-            analyze_word_timing_with_gemini(api_key, &compressed_audio_path, &word_items)?;
-        ensure_not_cancelled(cancel_flag, "Video export cancelled.")?;
-        segments
-    } else {
-        let _ = progress_tx.send(VideoEvent::Progress {
-            fraction: 0.23,
-            label: "B? qua word timing, ch? d?ng timing theo c?u.".to_string(),
-        });
-        Vec::new()
-    };
-    apply_subtitle_lead_to_word_segments(&mut word_segments, subtitle_lead_seconds);
+    let _ = progress_tx.send(VideoEvent::Progress {
+        fraction: 0.23,
+        label: "Sentence timing ready (word highlight disabled).".to_string(),
+    });
+    let word_segments = Vec::new();
     let srt_path = next_numbered_file_path(&project_subtitle_dir(output_dir), "subtitles", "srt")?;
     fs::write(&srt_path, build_srt_content(&timed_lines))
         .with_context(|| format!("Kh?ng ghi duoc {}", srt_path.display()))?;
     let word_path = word_timing_path_for_srt(&srt_path);
-    if enable_word_highlight {
-        fs::write(
-            &word_path,
-            serde_json::to_string_pretty(&word_segments)
-                .context("Kh?ng serialise duoc word timing JSON")?,
-        )
-        .with_context(|| format!("Kh?ng ghi duoc {}", word_path.display()))?;
-    } else if word_path.exists() {
+    if word_path.exists() {
         let _ = fs::remove_file(&word_path);
     }
     let _ = progress_tx.send(VideoEvent::Progress {
@@ -9669,7 +11365,6 @@ fn build_video_srt_with_gemini_background(
     audiobook_path: &Path,
     output_dir: &Path,
     pause_ms: u32,
-    enable_word_highlight: bool,
     subtitle_lead_seconds: f64,
     cancel_flag: &AtomicBool,
     progress_tx: Sender<SrtJobEvent>,
@@ -9697,38 +11392,131 @@ fn build_video_srt_with_gemini_background(
         analyze_sentence_timing_with_gemini(api_key, &compressed_audio_path, &sentence_items)?;
     ensure_not_cancelled(cancel_flag, "SRT generation cancelled.")?;
     apply_subtitle_lead_to_lines(&mut timed_lines, subtitle_lead_seconds);
-    let mut word_segments = if enable_word_highlight {
-        let _ = progress_tx.send(SrtJobEvent::Progress {
-            job_id,
-            fraction: 0.23,
-            label: "Creating word timing with Gemini...".to_string(),
-        });
-        let word_items = collect_word_items(&timed_lines);
-        let segments =
-            analyze_word_timing_with_gemini(api_key, &compressed_audio_path, &word_items)?;
-        ensure_not_cancelled(cancel_flag, "SRT generation cancelled.")?;
-        segments
-    } else {
-        let _ = progress_tx.send(SrtJobEvent::Progress {
-            job_id,
-            fraction: 0.23,
-            label: "Skipping word timing. Sentence timing only.".to_string(),
-        });
-        Vec::new()
-    };
-    apply_subtitle_lead_to_word_segments(&mut word_segments, subtitle_lead_seconds);
+    let _ = progress_tx.send(SrtJobEvent::Progress {
+        job_id,
+        fraction: 0.23,
+        label: "Sentence timing ready (word highlight disabled).".to_string(),
+    });
+    let word_segments = Vec::new();
     let srt_path = next_numbered_file_path(&project_subtitle_dir(output_dir), "subtitles", "srt")?;
     fs::write(&srt_path, build_srt_content(&timed_lines))
         .with_context(|| format!("Could not write {}", srt_path.display()))?;
     let word_path = word_timing_path_for_srt(&srt_path);
-    if enable_word_highlight {
-        fs::write(
-            &word_path,
-            serde_json::to_string_pretty(&word_segments)
-                .context("Could not serialize word timing JSON")?,
-        )
-        .with_context(|| format!("Could not write {}", word_path.display()))?;
-    } else if word_path.exists() {
+    if word_path.exists() {
+        let _ = fs::remove_file(&word_path);
+    }
+    let _ = progress_tx.send(SrtJobEvent::Progress {
+        job_id,
+        fraction: 1.0,
+        label: format!("SRT ready: {}", srt_path.display()),
+    });
+    Ok((srt_path, timed_lines, word_segments))
+}
+
+fn build_video_srt_with_groq(
+    api_key: &str,
+    groq_model: GroqSrtModel,
+    lines: &[BookLine],
+    speeches: &[ExportedSpeech],
+    audiobook_path: &Path,
+    output_dir: &Path,
+    pause_ms: u32,
+    subtitle_lead_seconds: f64,
+    cancel_flag: &AtomicBool,
+    progress_tx: Sender<VideoEvent>,
+) -> Result<(PathBuf, Vec<TimedBookLine>, Vec<TimedWordSegment>)> {
+    ensure_project_structure(output_dir)?;
+    ensure_not_cancelled(cancel_flag, "Video export cancelled.")?;
+    let _ = progress_tx.send(VideoEvent::Progress {
+        fraction: 0.05,
+        label: "Preparing audio for Groq Whisper...".to_string(),
+    });
+    let compressed_audio_path = project_subtitle_dir(output_dir).join("audiobook_for_groq.mp3");
+    compress_audio_for_groq(audiobook_path, &compressed_audio_path)?;
+    ensure_not_cancelled(cancel_flag, "SRT generation cancelled.")?;
+    let sentence_items = collect_sentence_items(lines, speeches, pause_ms)?;
+    if sentence_items.is_empty() {
+        return Err(anyhow!("Could not build sentence list for SRT."));
+    }
+    let _ = progress_tx.send(VideoEvent::Progress {
+        fraction: 0.16,
+        label: format!(
+            "Generating sentence timing with Groq ({})...",
+            groq_model.label()
+        ),
+    });
+    let mut timed_lines = analyze_sentence_timing_with_groq(
+        api_key,
+        &compressed_audio_path,
+        &sentence_items,
+        groq_model,
+    )?;
+    ensure_not_cancelled(cancel_flag, "Video export cancelled.")?;
+    apply_subtitle_lead_to_lines(&mut timed_lines, subtitle_lead_seconds);
+    let word_segments = Vec::new();
+    let srt_path = next_numbered_file_path(&project_subtitle_dir(output_dir), "subtitles", "srt")?;
+    fs::write(&srt_path, build_srt_content(&timed_lines))
+        .with_context(|| format!("Could not write {}", srt_path.display()))?;
+    let word_path = word_timing_path_for_srt(&srt_path);
+    if word_path.exists() {
+        let _ = fs::remove_file(&word_path);
+    }
+    let _ = progress_tx.send(VideoEvent::Progress {
+        fraction: 0.28,
+        label: format!("SRT created: {}", srt_path.display()),
+    });
+    Ok((srt_path, timed_lines, word_segments))
+}
+
+fn build_video_srt_with_groq_background(
+    job_id: u64,
+    api_key: &str,
+    groq_model: GroqSrtModel,
+    lines: &[BookLine],
+    speeches: &[ExportedSpeech],
+    audiobook_path: &Path,
+    output_dir: &Path,
+    pause_ms: u32,
+    subtitle_lead_seconds: f64,
+    cancel_flag: &AtomicBool,
+    progress_tx: Sender<SrtJobEvent>,
+) -> Result<(PathBuf, Vec<TimedBookLine>, Vec<TimedWordSegment>)> {
+    ensure_project_structure(output_dir)?;
+    ensure_not_cancelled(cancel_flag, "SRT generation cancelled.")?;
+    let _ = progress_tx.send(SrtJobEvent::Progress {
+        job_id,
+        fraction: 0.05,
+        label: "Preparing audio for Groq Whisper...".to_string(),
+    });
+    let compressed_audio_path = project_subtitle_dir(output_dir).join("audiobook_for_groq.mp3");
+    compress_audio_for_groq(audiobook_path, &compressed_audio_path)?;
+    ensure_not_cancelled(cancel_flag, "SRT generation cancelled.")?;
+    let sentence_items = collect_sentence_items(lines, speeches, pause_ms)?;
+    if sentence_items.is_empty() {
+        return Err(anyhow!("Could not prepare sentence list for SRT."));
+    }
+    let _ = progress_tx.send(SrtJobEvent::Progress {
+        job_id,
+        fraction: 0.16,
+        label: format!(
+            "Generating sentence timing with Groq ({})...",
+            groq_model.label()
+        ),
+    });
+    let mut timed_lines = analyze_sentence_timing_with_groq(
+        api_key,
+        &compressed_audio_path,
+        &sentence_items,
+        groq_model,
+    )?;
+    ensure_not_cancelled(cancel_flag, "SRT generation cancelled.")?;
+    apply_subtitle_lead_to_lines(&mut timed_lines, subtitle_lead_seconds);
+    let word_segments = Vec::new();
+    let srt_path = next_numbered_file_path(&project_subtitle_dir(output_dir), "subtitles", "srt")?;
+    fs::write(&srt_path, build_srt_content(&timed_lines))
+        .with_context(|| format!("Could not write {}", srt_path.display()))?;
+    let word_path = word_timing_path_for_srt(&srt_path);
+    if word_path.exists() {
         let _ = fs::remove_file(&word_path);
     }
     let _ = progress_tx.send(SrtJobEvent::Progress {
@@ -9972,8 +11760,10 @@ fn export_video_from_cache(
     resolution: VideoResolution,
     frame_rate: VideoFrameRate,
     pause_ms: u32,
-    api_key: &str,
-    enable_word_highlight: bool,
+    srt_provider: VideoSrtProvider,
+    gemini_api_key: &str,
+    groq_api_key: &str,
+    groq_srt_model: GroqSrtModel,
     cached_timed_lines: &[TimedBookLine],
     cached_word_segments: &[TimedWordSegment],
     cached_srt_path: &str,
@@ -9987,13 +11777,17 @@ fn export_video_from_cache(
     if !audiobook_path.exists() {
         return Err(anyhow!("Kh?ng tim thay audiobook de xuat video."));
     }
-    if api_key.trim().is_empty() {
-        return Err(anyhow!("Thi?u Gemini API key d? t?o SRT cho video."));
+    if srt_provider == VideoSrtProvider::Gemini && gemini_api_key.trim().is_empty() {
+        return Err(anyhow!("Missing Gemini API key for video SRT."));
+    }
+    if srt_provider == VideoSrtProvider::GroqWhisper && groq_api_key.trim().is_empty() {
+        return Err(anyhow!("Missing Groq API key for video SRT."));
     }
     fs::create_dir_all(output_dir)
         .with_context(|| format!("Kh?ng tao duoc {}", output_dir.display()))?;
     ensure_project_structure(output_dir)?;
-    let background_path = copy_background_to_project(output_dir, background_path)?;
+    let (width, height) = resolution.dimensions();
+    let background_path = prepare_background_for_video(output_dir, background_path, width, height)?;
 
     let (timed_lines, word_segments, srt_path) = if !cached_timed_lines.is_empty()
         && !cached_srt_path.trim().is_empty()
@@ -10007,21 +11801,33 @@ fn export_video_from_cache(
             PathBuf::from(cached_srt_path),
         )
     } else {
-        let (path, timed_lines, word_segments) = build_video_srt_with_gemini(
-            api_key,
-            lines,
-            speeches,
-            audiobook_path,
-            output_dir,
-            pause_ms,
-            enable_word_highlight,
-            subtitle_lead_seconds,
-            cancel_flag,
-            progress_tx.clone(),
-        )?;
+        let (path, timed_lines, word_segments) = match srt_provider {
+            VideoSrtProvider::Gemini => build_video_srt_with_gemini(
+                gemini_api_key,
+                lines,
+                speeches,
+                audiobook_path,
+                output_dir,
+                pause_ms,
+                subtitle_lead_seconds,
+                cancel_flag,
+                progress_tx.clone(),
+            )?,
+            VideoSrtProvider::GroqWhisper => build_video_srt_with_groq(
+                groq_api_key,
+                groq_srt_model,
+                lines,
+                speeches,
+                audiobook_path,
+                output_dir,
+                pause_ms,
+                subtitle_lead_seconds,
+                cancel_flag,
+                progress_tx.clone(),
+            )?,
+        };
         (timed_lines, word_segments, path)
     };
-    let (width, height) = resolution.dimensions();
     let subtitle_path = next_numbered_file_path(&project_subtitle_dir(output_dir), "captions", "ass")?;
     let video_path = next_numbered_file_path(&project_video_final_dir(output_dir), "video", "mp4")?;
     let ass_content = build_ass_subtitles(
@@ -10060,7 +11866,7 @@ fn export_video_from_cache(
     if let Some(ref path) = background_path {
         if path.exists() {
             command
-                .args(["-loop", "1"])
+                .args(["-framerate", "1", "-loop", "1"])
                 .arg("-i")
                 .arg(path);
         } else {
@@ -10095,9 +11901,11 @@ fn export_video_from_cache(
         "-tune",
         "stillimage",
         "-threads",
-        "2",
+        "1",
         "-profile:v",
         "baseline",
+        "-r",
+        &frame_rate.value().to_string(),
         "-pix_fmt",
         "yuv420p",
     ]);
@@ -10105,25 +11913,19 @@ fn export_video_from_cache(
     let video_filter = if let Some(ref path) = background_path {
         if path.exists() {
             format!(
-                "scale={}:{}:force_original_aspect_ratio=increase,crop={}:{},setsar=1,fps={},ass=filename={}",
-                width,
-                height,
-                width,
-                height,
+                "fps={},setsar=1,ass=filename={}",
                 frame_rate.value(),
                 escape_ffmpeg_ass_filename(&subtitle_path)
             )
         } else {
             format!(
-                "setsar=1,fps={},ass=filename={}",
-                frame_rate.value(),
+                "setsar=1,ass=filename={}",
                 escape_ffmpeg_ass_filename(&subtitle_path)
             )
         }
     } else {
         format!(
-            "setsar=1,fps={},ass=filename={}",
-            frame_rate.value(),
+            "setsar=1,ass=filename={}",
             escape_ffmpeg_ass_filename(&subtitle_path)
         )
     };
@@ -10249,9 +12051,9 @@ fn export_video_preview_segment(
         });
     }
 
-    ensure_project_structure(output_dir)?;
-    let background_path = copy_background_to_project(output_dir, background_path)?;
     let (width, height) = resolution.dimensions();
+    ensure_project_structure(output_dir)?;
+    let background_path = prepare_background_for_video(output_dir, background_path, width, height)?;
     let subtitle_path = next_numbered_file_path(&project_subtitle_dir(output_dir), "preview_captions", "ass")?;
     let video_path = next_numbered_file_path(&project_video_preview_dir(output_dir), "preview_video", "mp4")?;
     let ass_content = build_ass_subtitles(
@@ -10277,11 +12079,19 @@ fn export_video_preview_segment(
 
     let ffmpeg = find_ffmpeg()?;
     let mut command = Command::new(ffmpeg);
-    command.arg("-y").args(["-progress", "pipe:1", "-nostats"]);
+    command.arg("-y").args([
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        "-filter_threads",
+        "1",
+        "-filter_complex_threads",
+        "1",
+    ]);
     if let Some(ref path) = background_path {
         if path.exists() {
             command
-                .args(["-loop", "1"])
+                .args(["-framerate", "1", "-loop", "1"])
                 .arg("-i")
                 .arg(path);
         } else {
@@ -10324,7 +12134,11 @@ fn export_video_preview_segment(
         "-tune",
         "stillimage",
         "-threads",
-        "2",
+        "1",
+        "-profile:v",
+        "baseline",
+        "-r",
+        &frame_rate.value().to_string(),
         "-pix_fmt",
         "yuv420p",
     ]);
@@ -10332,25 +12146,19 @@ fn export_video_preview_segment(
     let video_filter = if let Some(ref path) = background_path {
         if path.exists() {
             format!(
-                "scale={}:{}:force_original_aspect_ratio=increase,crop={}:{},setsar=1,fps={},ass=filename={}",
-                width,
-                height,
-                width,
-                height,
+                "fps={},setsar=1,ass=filename={}",
                 frame_rate.value(),
                 escape_ffmpeg_ass_filename(&subtitle_path)
             )
         } else {
             format!(
-                "setsar=1,fps={},ass=filename={}",
-                frame_rate.value(),
+                "setsar=1,ass=filename={}",
                 escape_ffmpeg_ass_filename(&subtitle_path)
             )
         }
     } else {
         format!(
-            "setsar=1,fps={},ass=filename={}",
-            frame_rate.value(),
+            "setsar=1,ass=filename={}",
             escape_ffmpeg_ass_filename(&subtitle_path)
         )
     };
@@ -10631,11 +12439,16 @@ fn build_ass_subtitles(
                     build_ass_rect_path(tag_left, tag_top, tag_right, tag_bottom)
                 ));
             }
+            let (tag_align, tag_text_x, tag_text_y) = match tag_position {
+                VideoTagPosition::TopLeft => ("7", tag_left + 14, tag_top + 14),
+                VideoTagPosition::TopCenter => ("8", width / 2, tag_top + 14),
+            };
             out.push_str(&format!(
-                "Dialogue: 5,0:00:00.00,{},TagText,,0,0,0,,{{\\an7\\pos({},{})}}{}\n",
+                "Dialogue: 5,0:00:00.00,{},TagText,,0,0,0,,{{\\an{}\\pos({},{})}}{}\n",
                 full_end,
-                tag_left + 14,
-                tag_top + 14,
+                tag_align,
+                tag_text_x,
+                tag_text_y,
                 escape_ass_text(corner_tag.trim())
             ));
         }
@@ -10680,8 +12493,8 @@ fn build_ass_subtitles(
             .map(|item| item.bottom_y.saturating_sub(subtitle_state_item_height(item, &rendered)))
             .unwrap_or(card_top.saturating_add(line_gap))
             .saturating_sub(line_gap);
-        let clip_top = clip_top.max(card_top.saturating_add(line_gap));
-        let clip_bottom = card_bottom.saturating_sub(line_gap);
+        let clip_top = clip_top.max(card_top);
+        let clip_bottom = card_bottom;
         let clip_tag = format!("\\clip({},{},{},{})", card_left, card_top, card_right, card_bottom);
 
         if idx > 0 && transition_seconds > 0.0 {
@@ -11286,6 +13099,49 @@ fn read_wav_samples(path: &Path) -> Result<Vec<i16>> {
         out.push(sample.with_context(|| format!("Loi doc sample {}", path.display()))?);
     }
     Ok(out)
+}
+
+fn read_audio_samples_any(path: &Path) -> Result<Vec<i16>> {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+    {
+        if let Ok(samples) = read_wav_samples(path) {
+            return Ok(samples);
+        }
+    }
+
+    let ffmpeg = find_ffmpeg()?;
+    let temp_dir = app_data_dir().join("tmp");
+    fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("Kh?ng tao duoc thu muc {}", temp_dir.display()))?;
+    let temp_wav = temp_dir.join(format!("import_line_{}.wav", current_timestamp_ms()));
+    let sample_rate = SAMPLE_RATE.to_string();
+
+    let mut command = Command::new(ffmpeg);
+    command
+        .arg("-y")
+        .arg("-i")
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar"])
+        .arg(sample_rate)
+        .args(["-c:a", "pcm_s16le"])
+        .arg(&temp_wav);
+    let result = command
+        .output()
+        .with_context(|| format!("Kh?ng goi duoc ffmpeg de convert {}", path.display()))?;
+    if !result.status.success() {
+        return Err(anyhow!(
+            "ffmpeg could not convert {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+
+    let samples = read_wav_samples(&temp_wav)?;
+    let _ = fs::remove_file(&temp_wav);
+    Ok(samples)
 }
 
 fn transcribe_audio_with_gemini(
