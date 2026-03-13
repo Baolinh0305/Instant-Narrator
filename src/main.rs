@@ -1028,6 +1028,18 @@ impl TtsApp {
         !parse_book_lines(&self.book_output).is_empty() && self.missing_cached_book_line_indices().is_empty()
     }
 
+    fn save_project_text_snapshot(&mut self) -> Result<()> {
+        if self.last_export_dir.trim().is_empty() {
+            return Ok(());
+        }
+        let root = normalize_project_root(Path::new(&self.last_export_dir));
+        ensure_project_structure(&root)?;
+        write_project_text_files(&root, &self.book_input, &self.book_output)?;
+        self.last_export_dir = root.to_string_lossy().to_string();
+        let _ = self.persist_state_to_disk();
+        Ok(())
+    }
+
     fn set_book_line_speaker(&mut self, index: usize, speaker: &str) {
         let mut lines = parse_book_lines(&self.book_output);
         let Some(line) = lines.get_mut(index) else {
@@ -1049,6 +1061,7 @@ impl TtsApp {
             index + 1,
             normalized
         );
+        let _ = self.save_project_text_snapshot();
         let _ = self.persist_state_to_disk();
     }
 
@@ -1083,6 +1096,7 @@ impl TtsApp {
             "Updated text for line {}. Cached speech for this line was cleared, and the merged audiobook/subtitles must be rebuilt.",
             index + 1
         );
+        let _ = self.save_project_text_snapshot();
         let _ = self.persist_state_to_disk();
     }
 
@@ -5592,21 +5606,50 @@ impl eframe::App for TtsApp {
                         }
                         if self.show_book_source {
                             ui.label("Source text");
-                            ui.add_sized(
+                            let source_response = ui.add_sized(
                                 [ui.available_width(), 180.0],
                                 egui::TextEdit::multiline(&mut self.book_input)
                                     .desired_width(f32::INFINITY)
                                     .hint_text("Paste story text or book text here..."),
                             );
+                            if source_response.changed() {
+                                match self.save_project_text_snapshot() {
+                                    Ok(()) => {
+                                        self.book_status =
+                                            "Source text saved to current project.".to_string()
+                                    }
+                                    Err(err) => {
+                                        self.book_status = format!(
+                                            "Could not auto-save source text: {}",
+                                            err
+                                        )
+                                    }
+                                }
+                            }
                         }
                         if self.show_book_result {
                             ui.label("Narrator / character result");
-                            ui.add_sized(
+                            let result_response = ui.add_sized(
                                 [ui.available_width(), 220.0],
                                 egui::TextEdit::multiline(&mut self.book_output)
                                     .desired_width(f32::INFINITY)
                                     .hint_text("Parsed narrator / character output will appear here."),
                             );
+                            if result_response.changed() {
+                                match self.save_project_text_snapshot() {
+                                    Ok(()) => {
+                                        self.book_status =
+                                            "Narrator/character result saved to current project."
+                                                .to_string()
+                                    }
+                                    Err(err) => {
+                                        self.book_status = format!(
+                                            "Could not auto-save parsed result: {}",
+                                            err
+                                        )
+                                    }
+                                }
+                            }
                         }
                         ui.label(format!("Audiobook export folder: {}", self.last_export_dir));
                         if !self.last_audiobook_path.is_empty() {
@@ -7076,6 +7119,7 @@ impl eframe::App for TtsApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = self.save_project_text_snapshot();
         let _ = self.persist_state_to_disk();
     }
 }
